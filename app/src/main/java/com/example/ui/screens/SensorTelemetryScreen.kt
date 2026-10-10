@@ -202,7 +202,7 @@ fun SensorTelemetryScreen(
                                     Button(
                                         onClick = {
                                             PermissionAuditorHelper.openAppSettings(context, unusual.packageName)
-                                            viewModel.logPermissionCleanup(unusual.appName)
+                                            viewModel.logPermissionCleanup(unusual.appName, unusual.packageName)
                                         },
                                         colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
                                         modifier = Modifier.padding(start = 8.dp)
@@ -299,10 +299,50 @@ fun SensorTelemetryScreen(
                 }
             }
 
+            // Platform Policy Notice
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Default.Security, contentDescription = "Policy", tint = NeonCyan, modifier = Modifier.size(18.dp))
+                            Text(
+                                text = if (isBn) "অ্যান্ড্রয়েড পলিসি ও সেন্সর নিরাপত্তা তথ্য:" else "Android OS Platform Capability Notice:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = NeonCyan
+                            )
+                        }
+                        Text(
+                            text = if (isBn) {
+                                "অ্যান্ড্রয়েড লিনাক্স সিকিউরিটি স্যান্ডবক্সিংয়ের কারণে সাধারণ কোনো থার্ড-পার্টি অ্যাপ অন্য কোনো অ্যাপের অডিও বা ক্যামেরা স্ট্রিম সরাসরি শুনতে পারে না। ইনস্টল করা অ্যাপগুলোর বিপজ্জনক পারমিশন স্ট্যাটাস দেখতে পারমিশন অডিটর ব্যবহার করুন।"
+                            } else {
+                                "Android OS process isolation and sandboxing prevent standard apps from intercepting other applications' live microphone or camera streams. Use Permission Auditor to inspect granted hardware permissions."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
             // Real-time access history
             item {
                 Text(
-                    text = if (isBn) "সাম্প্রতিক সেন্সর ব্যবহারের লগ" else "Recent Sensor Access Events",
+                    text = if (isBn) "সাম্প্রতিক সেন্সর ব্যবহারের লগ (${allLogs.size})" else "Recent Sensor Access Events (${allLogs.size})",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onBackground,
@@ -310,8 +350,31 @@ fun SensorTelemetryScreen(
                 )
             }
 
-            items(allLogs, key = { it.id }) { log ->
-                SensorAccessLogItem(log = log, isBn = isBn)
+            if (allLogs.isEmpty()) {
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 20.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(Icons.Default.Mic, contentDescription = "No Events", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(40.dp))
+                            Text(
+                                text = if (isBn) "কোনো সেন্সর অনুপ্রবেশ রেকর্ড নেই" else "No Unauthorized Sensor Access Recorded",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            } else {
+                items(allLogs, key = { it.id }) { log ->
+                    SensorAccessLogItem(log = log, isBn = isBn)
+                }
             }
         }
     }

@@ -323,7 +323,7 @@ fun PermissionAuditorScreen(
                     isBn = isBn,
                     onRevokePermissions = {
                         PermissionAuditorHelper.openAppSettings(context, app.packageName)
-                        viewModel.logPermissionCleanup(app.appName)
+                        viewModel.logPermissionCleanup(app.appName, app.packageName)
                         scope.launch {
                             val msg = if (isBn) {
                                 "${app.appName} এর সিস্টেম সেটিংস খোলা হয়েছে। অপ্রয়োজনীয় পারমিশন রিমুভ করুন।"

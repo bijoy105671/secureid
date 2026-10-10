@@ -24,4 +24,7 @@ interface CloudDriveDao {
 
     @Query("UPDATE cloud_drive_items SET shareStatus = 'PRIVATE', isLeaking = 0")
     suspend fun revokeAllPublicLinks()
+
+    @Query("DELETE FROM cloud_drive_items")
+    suspend fun clearAll()
 }

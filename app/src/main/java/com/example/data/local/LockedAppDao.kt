@@ -33,4 +33,16 @@ interface LockedAppDao {
 
     @Query("UPDATE locked_apps SET requireRemoteApproval = :requireRemote WHERE packageName = :packageName")
     suspend fun setRemoteApprovalRequirement(packageName: String, requireRemote: Boolean)
+
+    @Query("SELECT COUNT(*) FROM locked_apps")
+    suspend fun getCount(): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(app: LockedAppEntity)
+
+    @Query("UPDATE locked_apps SET isLocked = :isLocked WHERE packageName = :packageName")
+    suspend fun updateLockStatus(packageName: String, isLocked: Boolean)
+
+    @Query("UPDATE locked_apps SET requirePin = :pin, requireOtp = :otp, requireRemoteApproval = :remote WHERE packageName = :packageName")
+    suspend fun updateSecurityPolicies(packageName: String, pin: Boolean, otp: Boolean, remote: Boolean)
 }

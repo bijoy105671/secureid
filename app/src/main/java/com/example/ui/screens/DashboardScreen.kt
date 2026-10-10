@@ -102,6 +102,7 @@ fun DashboardScreen(
     val unusualSensors by viewModel.unusualSensorLogs.collectAsState()
     val driveItems by viewModel.allDriveItems.collectAsState()
     val simStatus by viewModel.simStatus.collectAsState()
+    val isLockdownRunning by viewModel.isLockdownServiceRunning.collectAsState()
 
     var showChangePinDialog by remember { mutableStateOf(false) }
     var newPinInput by remember { mutableStateOf("") }
@@ -559,8 +560,8 @@ fun DashboardScreen(
                             }
                         }
                         Switch(
-                            checked = viewModel.prefs.isAntiPowerOffEnabled(),
-                            onCheckedChange = { viewModel.prefs.setAntiPowerOffEnabled(it) },
+                            checked = isLockdownRunning,
+                            onCheckedChange = { viewModel.toggleLockdownService(it) },
                             colors = SwitchDefaults.colors(checkedThumbColor = ShieldGreen)
                         )
                     }

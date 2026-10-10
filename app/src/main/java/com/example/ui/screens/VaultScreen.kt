@@ -101,6 +101,52 @@ fun VaultScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
+    val isSetupDone by viewModel.isSetupDone.collectAsState()
+    val remainingLockout by viewModel.remainingLockoutSeconds.collectAsState()
+
+    if (!isSetupDone) {
+        // First-run Credential Setup Screen
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = onBack, modifier = Modifier.testTag("vault_setup_back_btn")) {
+                        Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                    Text(
+                        text = if (isBn) "মাস্টার পিন সেটআপ" else "Master PIN Setup",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                PinPadModal(
+                    title = if (isBn) "ভল্ট মাস্টার পিন সেট করুন" else "Create Master PIN",
+                    subtitle = if (isBn) "ফাইল এনক্রিপশন ও অ্যাপ লকের জন্য নতুন ৪-ডিজিটের গোপন পিন দিন" else "Set a secure 4-digit PIN to protect your vault and apps",
+                    isBengali = isBn,
+                    onPinSubmitted = { enteredPin ->
+                        viewModel.setupMasterPin(enteredPin)
+                    }
+                )
+            }
+        }
+        return
+    }
+
     if (!isVaultUnlocked) {
         // Vault Lock Screen (Enter PIN or Biometrics)
         Box(
@@ -138,15 +184,21 @@ fun VaultScreen(
                     )
                 }
 
+                val lockoutSubtitle = if (remainingLockout > 0) {
+                    if (isBn) "⚠️ ভুল চেষ্টার কারণে লকডাউন: $remainingLockout সেকেন্ড বাকি" else "⚠️ Throttling active: wait $remainingLockout seconds"
+                } else {
+                    if (isBn) "ছবি, অডিও, ভিডিও ও পিডিএফ দেখতে মাস্টার পিন দিন" else "Enter Master PIN to access photos, audio, video & PDFs"
+                }
+
                 PinPadModal(
                     title = if (isBn) "এনক্রিপ্টেড ভল্ট লকড" else "Encrypted Vault Locked",
-                    subtitle = if (isBn) "ছবি, অডিও, ভিডিও ও পিডিএফ দেখতে মাস্টার পিন দিন" else "Enter Master PIN to access photos, audio, video & PDFs",
+                    subtitle = lockoutSubtitle,
                     isBengali = isBn,
                     onPinSubmitted = { enteredPin ->
                         viewModel.verifyMasterPin(enteredPin)
                     },
                     onBiometricSuccess = {
-                        viewModel.verifyMasterPin("1234") // Fingerprint bypass
+                        viewModel.onBiometricUnlocked()
                     }
                 )
             }
@@ -358,6 +410,7 @@ fun VaultScreen(
     previewFile?.let { file ->
         FilePreviewDialog(
             file = file,
+            viewModel = viewModel,
             isBn = isBn,
             onDismiss = { previewFile = null },
             onShare = {
@@ -577,10 +630,13 @@ fun AddVaultFileDialog(
 @Composable
 fun FilePreviewDialog(
     file: VaultFileEntity,
+    viewModel: SecurityViewModel,
     isBn: Boolean,
     onDismiss: () -> Unit,
     onShare: () -> Unit
 ) {
+    val decryptedText = remember(file) { viewModel.decryptVaultContent(file) }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -603,14 +659,14 @@ fun FilePreviewDialog(
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            text = if (isBn) "ডিক্রিপ্ট করা ডেটা প্রিভিউ:" else "Decrypted Content Preview:",
+                            text = if (isBn) "ডিক্রিপ্ট করা ডেটা প্রিভিউ (AES-256-GCM Verified):" else "Decrypted Content Preview (AES-256-GCM Verified):",
                             style = MaterialTheme.typography.labelSmall,
                             color = NeonCyan
                         )
                         Text(
-                            text = if (file.secretContent.isNotBlank()) file.secretContent else (file.description.ifEmpty { "Binary encrypted stream [AES-256 GCM Block Verified]" }),
+                            text = decryptedText ?: if (isBn) "⚠️ ডিক্রিপশন ব্যর্থ বা ফাইল পরিবর্তিত হয়েছে।" else "⚠️ Decryption failed or file tampered.",
                             style = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = if (decryptedText != null) MaterialTheme.colorScheme.onSurface else DangerRed
                         )
                     }
                 }

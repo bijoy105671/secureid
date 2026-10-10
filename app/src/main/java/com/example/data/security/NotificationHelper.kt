@@ -122,4 +122,12 @@ object NotificationHelper {
         } catch (_: SecurityException) {
         }
     }
+
+    fun showShutdownAttemptNotification(
+        context: Context,
+        title: String,
+        message: String
+    ) {
+        showAntiTheftEmergencyNotification(context, title, message)
+    }
 }

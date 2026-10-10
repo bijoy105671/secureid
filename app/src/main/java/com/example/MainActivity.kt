@@ -77,6 +77,16 @@ class MainActivity : ComponentActivity() {
             else -> Screen.DASHBOARD
         }
 
+        val prefs = com.example.data.security.SecurityPreferences(this)
+        if (prefs.isBootLockdownActive() || (prefs.isAntiPowerOffEnabled() && com.example.data.security.DeviceLockdownService.isLockdownActive.value)) {
+            val lockdownIntent = android.content.Intent(this, com.example.ui.screens.LockdownActivity::class.java).apply {
+                flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                        android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("EXTRA_REASON", "Active Device Lockdown (OTP Required)")
+            }
+            startActivity(lockdownIntent)
+        }
+
         setContent {
             MyApplicationTheme {
                 val viewModel: SecurityViewModel = viewModel()

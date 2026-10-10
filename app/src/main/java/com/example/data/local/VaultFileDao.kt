@@ -28,4 +28,7 @@ interface VaultFileDao {
 
     @Query("DELETE FROM vault_files WHERE id = :id")
     suspend fun deleteById(id: Long)
+
+    @Query("SELECT * FROM vault_files")
+    suspend fun getAllFilesSync(): List<VaultFileEntity>
 }

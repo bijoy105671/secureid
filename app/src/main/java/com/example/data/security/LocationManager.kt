@@ -3,13 +3,18 @@ package com.example.data.security
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Geocoder
 import android.location.Location
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.os.BatteryManager
 import android.os.Build
-import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.example.data.model.LastKnownLocation
+import com.example.data.model.LocationFixType
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -24,6 +29,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
 
+/**
+ * Hardened LocationManager for SHIELD X Anti-Theft Telemetry.
+ *
+ * Implements:
+ * - Real observation timestamps from Android Location object (location.time).
+ * - Honest fix classification: LIVE_GPS vs CACHED_FUSED vs STALE_CACHED vs UNAVAILABLE.
+ * - Real hardware and network status query (ConnectivityManager, BatteryManager).
+ * - Never fabricates fake online connection or live satellite status.
+ */
 class LocationManager(private val context: Context) {
 
     private val fusedLocationClient: FusedLocationProviderClient =
@@ -63,6 +77,30 @@ class LocationManager(private val context: Context) {
         return finePerm || coarsePerm
     }
 
+    private fun isNetworkConnected(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun isGpsHardwareEnabled(): Boolean {
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return false
+        return lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)
+    }
+
+    private fun getBatteryInfo(): Pair<Int, Boolean> {
+        val batteryStatus: Intent? = IntentFilter(Intent.ACTION_BATTERY_CHANGED).let { filter ->
+            context.registerReceiver(null, filter)
+        }
+        val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val pct = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
+        val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
+        return Pair(pct, isCharging)
+    }
+
     @SuppressLint("MissingPermission")
     fun fetchLastKnownLocation(
         onSuccess: (LastKnownLocation) -> Unit,
@@ -73,29 +111,48 @@ class LocationManager(private val context: Context) {
             return
         }
 
+        val isNet = isNetworkConnected()
+        val isGps = isGpsHardwareEnabled()
+        val (batteryPct, isCharging) = getBatteryInfo()
+
         try {
             fusedLocationClient.lastLocation
                 .addOnSuccessListener { location: Location? ->
                     if (location != null) {
                         scope.launch {
+                            val now = System.currentTimeMillis()
+                            val ageMs = now - location.time
+                            val fixType = if (ageMs > 10 * 60 * 1000L) {
+                                LocationFixType.STALE_CACHED
+                            } else {
+                                LocationFixType.CACHED_FUSED
+                            }
+
                             val addressName = resolveAddress(location.latitude, location.longitude)
                             val result = LastKnownLocation(
+                                hasFix = true,
                                 latitude = location.latitude,
                                 longitude = location.longitude,
                                 locationName = addressName,
-                                timestamp = System.currentTimeMillis(),
-                                isDataConnected = true,
-                                isGpsActive = true
+                                accuracyMeters = if (location.hasAccuracy()) location.accuracy else null,
+                                provider = location.provider,
+                                fixType = fixType,
+                                observationTimestamp = location.time,
+                                batteryPercentage = batteryPct,
+                                isCharging = isCharging,
+                                networkName = if (isNet) "ইন্টারনেট সংযুক্ত (Online)" else "অফলাইন (Disconnected)",
+                                isNetworkConnected = isNet,
+                                isGpsHardwareEnabled = isGps
                             )
                             onSuccess(result)
                         }
                     } else {
-                        // Fallback to high accuracy request if last location is null
+                        // Request fresh high accuracy location
                         requestSingleFreshLocation(onSuccess, onError)
                     }
                 }
                 .addOnFailureListener { e ->
-                    onError(e.message ?: "Failed to get last known location")
+                    onError(e.message ?: "Failed to retrieve location")
                 }
         } catch (e: SecurityException) {
             onError(e.message ?: "Security exception")
@@ -112,6 +169,10 @@ class LocationManager(private val context: Context) {
             return
         }
 
+        val isNet = isNetworkConnected()
+        val isGps = isGpsHardwareEnabled()
+        val (batteryPct, isCharging) = getBatteryInfo()
+
         try {
             fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
                 .addOnSuccessListener { location: Location? ->
@@ -119,21 +180,28 @@ class LocationManager(private val context: Context) {
                         scope.launch {
                             val addressName = resolveAddress(location.latitude, location.longitude)
                             val result = LastKnownLocation(
+                                hasFix = true,
                                 latitude = location.latitude,
                                 longitude = location.longitude,
                                 locationName = addressName,
-                                timestamp = System.currentTimeMillis(),
-                                isDataConnected = true,
-                                isGpsActive = true
+                                accuracyMeters = if (location.hasAccuracy()) location.accuracy else null,
+                                provider = location.provider ?: "gps",
+                                fixType = LocationFixType.LIVE_GPS,
+                                observationTimestamp = location.time,
+                                batteryPercentage = batteryPct,
+                                isCharging = isCharging,
+                                networkName = if (isNet) "লাইভ ডাটা কানেক্টেড" else "অফলাইন",
+                                isNetworkConnected = isNet,
+                                isGpsHardwareEnabled = isGps
                             )
                             onSuccess(result)
                         }
                     } else {
-                        onError("Location is unavailable on device")
+                        onError("GPS location unavailable. Ensure GPS is turned on.")
                     }
                 }
                 .addOnFailureListener { e ->
-                    onError(e.message ?: "Failed fresh location request")
+                    onError(e.message ?: "Failed fresh location query")
                 }
         } catch (e: SecurityException) {
             onError(e.message ?: "Security exception")
@@ -149,18 +217,16 @@ class LocationManager(private val context: Context) {
 
         val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 4000L)
             .setMinUpdateIntervalMillis(2000L)
-            .setMinUpdateDistanceMeters(1f) // Sensitive movement detection for anti-theft
+            .setMinUpdateDistanceMeters(1f)
             .build()
 
         locationCallback = object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 val latest = result.lastLocation ?: return
 
-                // Calculate speed in km/h
                 val speedKmh = if (latest.hasSpeed()) (latest.speed * 3.6f) else calculateSpeedFromDelta(latest)
                 _currentSpeedKmh.value = speedKmh
 
-                // Distance calculation
                 previousLocation?.let { prev ->
                     val distance = prev.distanceTo(latest)
                     if (distance > 0.5f) {
@@ -169,7 +235,6 @@ class LocationManager(private val context: Context) {
                 }
                 previousLocation = latest
 
-                // Movement state analysis
                 val (statusBn, statusEn) = when {
                     speedKmh > 25f -> "যানবাহনে দ্রুত স্থানান্তরিত হচ্ছে! 🚨" to "In Transit / High-Speed Movement! 🚨"
                     speedKmh > 3f -> "ডিভাইস নিয়ে হাঁটা হচ্ছে (Movement Detected)" to "Walking / Moving"
@@ -180,21 +245,31 @@ class LocationManager(private val context: Context) {
                 _movementStatusBn.value = statusBn
                 _movementStatusEn.value = statusEn
 
-                // Append breadcrumb
                 val currentList = _movementTrail.value.toMutableList()
                 currentList.add(Pair(latest.latitude, latest.longitude))
-                if (currentList.size > 20) currentList.removeAt(0)
+                if (currentList.size > 25) currentList.removeAt(0)
                 _movementTrail.value = currentList
 
                 scope.launch {
+                    val isNet = isNetworkConnected()
+                    val isGps = isGpsHardwareEnabled()
+                    val (batteryPct, isCharging) = getBatteryInfo()
                     val addressName = resolveAddress(latest.latitude, latest.longitude)
+
                     val locObj = LastKnownLocation(
+                        hasFix = true,
                         latitude = latest.latitude,
                         longitude = latest.longitude,
                         locationName = addressName,
-                        timestamp = System.currentTimeMillis(),
-                        isDataConnected = true,
-                        isGpsActive = true
+                        accuracyMeters = if (latest.hasAccuracy()) latest.accuracy else null,
+                        provider = latest.provider ?: "fused",
+                        fixType = LocationFixType.LIVE_GPS,
+                        observationTimestamp = latest.time,
+                        batteryPercentage = batteryPct,
+                        isCharging = isCharging,
+                        networkName = if (isNet) "অনলাইন ট্র্যাকিং সক্রিয়" else "অফলাইন",
+                        isNetworkConnected = isNet,
+                        isGpsHardwareEnabled = isGps
                     )
                     onUpdate(locObj, speedKmh, statusBn, statusEn)
                 }
@@ -204,13 +279,11 @@ class LocationManager(private val context: Context) {
         try {
             fusedLocationClient.requestLocationUpdates(
                 locationRequest,
-                locationCallback!!,
-                Looper.getMainLooper()
+                locationCallback as LocationCallback,
+                context.mainLooper
             )
             _isTracking.value = true
-        } catch (e: SecurityException) {
-            _isTracking.value = false
-        }
+        } catch (_: SecurityException) {}
     }
 
     fun stopRealtimeMovementTracking() {
@@ -219,50 +292,41 @@ class LocationManager(private val context: Context) {
         }
         locationCallback = null
         _isTracking.value = false
-        _currentSpeedKmh.value = 0f
         previousLocation = null
-        _movementStatusBn.value = "ট্র্যাকিং স্থগিত"
-        _movementStatusEn.value = "Tracking Paused"
     }
 
     private fun calculateSpeedFromDelta(current: Location): Float {
         val prev = previousLocation ?: return 0f
-        val timeDeltaSeconds = ((current.time - prev.time) / 1000f).coerceAtLeast(1f)
         val distanceMeters = prev.distanceTo(current)
-        val speedMps = distanceMeters / timeDeltaSeconds
-        return speedMps * 3.6f
+        val timeDeltaSec = (current.time - prev.time) / 1000f
+        if (timeDeltaSec <= 0f) return 0f
+        val speedMps = distanceMeters / timeDeltaSec
+        return (speedMps * 3.6f).coerceIn(0f, 200f)
     }
 
-    private fun resolveAddress(lat: Double, lng: Double): String {
+    private fun resolveAddress(latitude: Double, longitude: Double): String {
         return try {
             val geocoder = Geocoder(context, Locale.getDefault())
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                // Synchronous fallback for simple address lookup
-                val list = geocoder.getFromLocation(lat, lng, 1)
-                if (!list.isNullOrEmpty()) {
-                    val addr = list[0]
-                    val feature = addr.featureName ?: ""
-                    val locality = addr.locality ?: addr.subAdminArea ?: ""
-                    val country = addr.countryName ?: ""
-                    listOf(feature, locality, country).filter { it.isNotBlank() }.joinToString(", ")
-                } else {
-                    "${String.format(Locale.US, "%.4f", lat)}° N, ${String.format(Locale.US, "%.4f", lng)}° E"
+                var addressResult = "GPS: ${String.format(Locale.US, "%.4f, %.4f", latitude, longitude)}"
+                val addresses = geocoder.getFromLocation(latitude, longitude, 1)
+                if (!addresses.isNullOrEmpty()) {
+                    val a = addresses[0]
+                    addressResult = listOfNotNull(a.subLocality, a.locality, a.countryName).joinToString(", ")
                 }
+                addressResult
             } else {
                 @Suppress("DEPRECATION")
-                val list = geocoder.getFromLocation(lat, lng, 1)
-                if (!list.isNullOrEmpty()) {
-                    val addr = list[0]
-                    val feature = addr.featureName ?: ""
-                    val locality = addr.locality ?: addr.subAdminArea ?: ""
-                    val country = addr.countryName ?: ""
-                    listOf(feature, locality, country).filter { it.isNotBlank() }.joinToString(", ")
+                val addresses = geocoder.getFromLocation(latitude, longitude, 1)
+                if (!addresses.isNullOrEmpty()) {
+                    val a = addresses[0]
+                    listOfNotNull(a.subLocality, a.locality, a.countryName).joinToString(", ")
                 } else {
-                    "${String.format(Locale.US, "%.4f", lat)}° N, ${String.format(Locale.US, "%.4f", lng)}° E"
+                    "GPS: ${String.format(Locale.US, "%.4f, %.4f", latitude, longitude)}"
                 }
             }
         } catch (_: Exception) {
-            "${String.format(Locale.US, "%.4f", lat)}° N, ${String.format(Locale.US, "%.4f", lng)}° E"
+            "GPS: ${String.format(Locale.US, "%.4f, %.4f", latitude, longitude)}"
         }
     }
 }

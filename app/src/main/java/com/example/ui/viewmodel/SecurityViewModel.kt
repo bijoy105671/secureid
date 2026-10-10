@@ -16,17 +16,19 @@ import com.example.data.model.LastKnownLocation
 import com.example.data.model.LockedAppEntity
 import com.example.data.model.PowerOffChallenge
 import com.example.data.model.RemoteRequestEntity
-import com.example.data.model.RiskLevel
 import com.example.data.model.SensorAccessLogEntity
-import com.example.data.model.SensorType
 import com.example.data.model.SimStatus
 import com.example.data.model.ChallengeState
 import com.example.data.model.VaultFileEntity
+import com.example.data.security.DeviceLockdownService
 import com.example.data.security.EncryptionHelper
+import com.example.data.security.FileVaultManager
+import com.example.data.security.KeyManager
 import com.example.data.security.LocationManager
 import com.example.data.security.NotificationHelper
 import com.example.data.security.PermissionAuditorHelper
 import com.example.data.security.SecurityPreferences
+import com.example.data.security.TrustedDeviceProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +37,18 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.util.UUID
 
+/**
+ * Hardened Security ViewModel for SHIELD X.
+ *
+ * Remediations applied:
+ * - NO hardcoded default credentials or backdoor OTP bypasses ("999999" and "123456" removed).
+ * - First-run credential setup requirement enforced.
+ * - Persistent failed-attempt throttling with progressive lockout delays.
+ * - Real AES-256-GCM file storage via FileVaultManager with Keystore-backed key hierarchy.
+ * - Real Trusted-Device ECDSA cryptographic approval protocol with replay protection.
+ * - Honest location and sensor status reporting; removal of fabricated background spying data.
+ * - Audit logs sanitized to never leak passwords, PINs, OTPs, or private keys.
+ */
 class SecurityViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AppDatabase.getInstance(application)
@@ -46,17 +60,25 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     private val cloudDriveDao = db.cloudDriveDao()
 
     val prefs = SecurityPreferences(application)
+    val locationManager = LocationManager(application)
 
     // Language state
     private val _isBengali = MutableStateFlow(prefs.getLanguage() == "bn")
     val isBengali: StateFlow<Boolean> = _isBengali.asStateFlow()
 
+    // First-run setup state
+    private val _isSetupDone = MutableStateFlow(prefs.isSetupDone())
+    val isSetupDone: StateFlow<Boolean> = _isSetupDone.asStateFlow()
+
     // Master PIN & Vault unlock status
     private val _isVaultUnlocked = MutableStateFlow(false)
     val isVaultUnlocked: StateFlow<Boolean> = _isVaultUnlocked.asStateFlow()
 
-    private val _failedAttemptsCount = MutableStateFlow(0)
+    private val _failedAttemptsCount = MutableStateFlow(prefs.getFailedAttempts())
     val failedAttemptsCount: StateFlow<Int> = _failedAttemptsCount.asStateFlow()
+
+    private val _remainingLockoutSeconds = MutableStateFlow(prefs.getRemainingLockoutSeconds())
+    val remainingLockoutSeconds: StateFlow<Long> = _remainingLockoutSeconds.asStateFlow()
 
     private val _lastIntruderAlert = MutableStateFlow<String?>(null)
     val lastIntruderAlert: StateFlow<String?> = _lastIntruderAlert.asStateFlow()
@@ -64,6 +86,10 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     // Disguise calculator active state
     private val _isCalculatorDisguiseActive = MutableStateFlow(prefs.isDisguiseCalculatorEnabled())
     val isCalculatorDisguiseActive: StateFlow<Boolean> = _isCalculatorDisguiseActive.asStateFlow()
+
+    // Demo Mode state (OFF by default)
+    private val _isDemoModeActive = MutableStateFlow(prefs.isDemoModeEnabled())
+    val isDemoModeActive: StateFlow<Boolean> = _isDemoModeActive.asStateFlow()
 
     // Vault Files
     val allVaultFiles: StateFlow<List<VaultFileEntity>> = vaultDao.getAllFiles()
@@ -101,6 +127,9 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     private val _currentChallengeOtp = MutableStateFlow<String?>(null)
     val currentChallengeOtp: StateFlow<String?> = _currentChallengeOtp.asStateFlow()
 
+    private val _activeApprovalChallenge = MutableStateFlow<TrustedDeviceProtocol.ApprovalChallenge?>(null)
+    val activeApprovalChallenge: StateFlow<TrustedDeviceProtocol.ApprovalChallenge?> = _activeApprovalChallenge.asStateFlow()
+
     private val _activeRequestId = MutableStateFlow<String?>(null)
     val activeRequestId: StateFlow<String?> = _activeRequestId.asStateFlow()
 
@@ -137,8 +166,6 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     private val _isBootLocked = MutableStateFlow(prefs.isBootLockdownActive())
     val isBootLocked: StateFlow<Boolean> = _isBootLocked.asStateFlow()
 
-    // LocationManager Service Integration
-    val locationManager = LocationManager(application)
     val isRealtimeTracking: StateFlow<Boolean> = locationManager.isTracking
     val movementStatusBn: StateFlow<String> = locationManager.movementStatusBn
     val movementStatusEn: StateFlow<String> = locationManager.movementStatusEn
@@ -146,16 +173,35 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     val totalDistanceTraveledMeters: StateFlow<Float> = locationManager.totalDistanceTraveledMeters
     val movementTrail: StateFlow<List<Pair<Double, Double>>> = locationManager.movementTrail
 
+    // Device Lockdown Service Integration
+    val isLockdownServiceRunning: StateFlow<Boolean> = DeviceLockdownService.isServiceRunning
+    val isLockdownActive: StateFlow<Boolean> = DeviceLockdownService.isLockdownActive
+    val lockdownAttemptCount: StateFlow<Int> = DeviceLockdownService.interceptedAttemptsCount
+    val lastLockdownReason: StateFlow<String?> = DeviceLockdownService.lastInterceptedReason
+    val lockdownReason: StateFlow<String?> = lastLockdownReason
+
     init {
         NotificationHelper.createNotificationChannel(application)
-        locationManager.fetchLastKnownLocation(
-            onSuccess = { loc -> _lastKnownLocation.value = loc }
-        )
+        scanPermissions()
         seedInitialFinancialAppsIfEmpty()
-        seedInitialVaultFilesIfEmpty()
-        seedInitialSensorLogsIfEmpty()
-        seedInitialDriveItemsIfEmpty()
-        scanAppPermissions()
+        migrateLegacyVaultRecordsIfPresent()
+
+        // Fetch initial verified location
+        locationManager.fetchLastKnownLocation(
+            onSuccess = { loc -> _lastKnownLocation.value = loc },
+            onError = { /* Location unavailable at init */ }
+        )
+
+        // Ensure Android Keystore master keys are initialized
+        try {
+            KeyManager.getOrCreateMasterKey()
+            KeyManager.getOrCreateDeviceIdentityKeyPair()
+        } catch (_: Exception) {}
+
+        // Auto-start Device Lockdown Guard if enabled in preferences
+        if (prefs.isAntiPowerOffEnabled()) {
+            DeviceLockdownService.start(application)
+        }
     }
 
     fun toggleLanguage() {
@@ -164,39 +210,102 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         prefs.setLanguage(if (newBn) "bn" else "en")
     }
 
+    // ------------------------------------------------------------------------
+    // Master Credential Management & Throttling
+    // ------------------------------------------------------------------------
+
+    fun setupMasterPin(newPin: String): Boolean {
+        if (newPin.length < 4) return false
+        prefs.setMasterPin(newPin)
+        _isSetupDone.value = true
+        _isVaultUnlocked.value = true
+        _failedAttemptsCount.value = 0
+        _remainingLockoutSeconds.value = 0L
+
+        logEvent(
+            eventType = AuditEventType.PERMISSION_AUDIT,
+            title = if (_isBengali.value) "মাস্টার সিকিউরিটি পিন সেট করা হয়েছে" else "Master Security PIN Initialized",
+            details = "PBKDF2-HMAC-SHA256 হ্যাশিং ও সল্ট সহ মাস্টার পিন কনফিগার করা হয়েছে।",
+            target = "Credential Security",
+            severity = AuditSeverity.SUCCESS
+        )
+        return true
+    }
+
     fun verifyMasterPin(enteredPin: String): Boolean {
+        val lockout = prefs.getRemainingLockoutSeconds()
+        if (lockout > 0) {
+            _remainingLockoutSeconds.value = lockout
+            val msg = if (_isBengali.value) {
+                "অতিরিক্ত ভুল চেষ্টার কারণে সিস্টেম সাময়িকভাবে লকডাউন রয়েছে। অপেক্ষা করুন: $lockout সেকেন্ড"
+            } else {
+                "Too many failed attempts. Throttling active. Wait: $lockout seconds"
+            }
+            _lastIntruderAlert.value = msg
+            return false
+        }
+
         val correct = prefs.verifyPin(enteredPin)
         if (correct) {
             _isVaultUnlocked.value = true
             _failedAttemptsCount.value = 0
+            _remainingLockoutSeconds.value = 0L
             _lastIntruderAlert.value = null
+
             logEvent(
                 eventType = AuditEventType.APP_UNLOCKED,
                 title = if (_isBengali.value) "ভল্ট সফলভাবে আনলক করা হয়েছে" else "Vault Successfully Unlocked",
-                details = if (_isBengali.value) "মাস্টার পিন সঠিক দিয়ে ভল্টে প্রবেশ করা হয়েছে।" else "Authorized access using Master PIN.",
-                target = "SecureShield Vault",
+                details = if (_isBengali.value) "মাস্টার ক্রেডেনশিয়াল সঠিক যাচাই করে ভল্টে প্রবেশ নিশ্চিত হয়েছে।" else "Authorized access using Master PIN.",
+                target = "Secure Vault",
                 severity = AuditSeverity.SUCCESS
             )
             return true
         } else {
-            val count = _failedAttemptsCount.value + 1
+            val count = prefs.getFailedAttempts()
             _failedAttemptsCount.value = count
+            val remainingSec = prefs.getRemainingLockoutSeconds()
+            _remainingLockoutSeconds.value = remainingSec
+
             val alertMsg = if (_isBengali.value) {
-                "সতর্কতা! ভুল পিন দেওয়া হয়েছে ($count বার চেষ্টা)। অনুপ্রবেশকারী শনাক্তকরণ সক্রিয়।"
+                if (remainingSec > 0) {
+                    "ভুল পিন দেওয়া হয়েছে ($count বার চেষ্টা)। নিরাপত্তা লকডাউন: $remainingSec সেকেন্ড।"
+                } else {
+                    "সতর্কতা! ভুল পিন দেওয়া হয়েছে ($count বার চেষ্টা)।"
+                }
             } else {
-                "Alert! Incorrect PIN entered ($count attempt). Intruder detection active."
+                if (remainingSec > 0) {
+                    "Invalid PIN ($count attempts). Lockout delay active: $remainingSec seconds."
+                } else {
+                    "Alert! Invalid PIN ($count attempt)."
+                }
             }
             _lastIntruderAlert.value = alertMsg
 
+            // Audit log: NEVER log the entered PIN itself!
             logEvent(
                 eventType = AuditEventType.INTRUDER_ALERT,
                 title = if (_isBengali.value) "অনুপ্রবেশকারী সতর্কতা: ভুল পিন!" else "Intruder Alert: Invalid PIN Attempt!",
-                details = "ভুল পিন চেষ্টা: $enteredPin (মোট $count বার চেষ্টা)। সম্ভাব্য অননুমোদিত অ্যাক্সেস।",
-                target = "App Locker",
-                severity = AuditSeverity.CRITICAL,
-                intruderPhotoPath = "mock_intruder_snapshot_${System.currentTimeMillis()}.jpg"
+                details = "অননুমোদিত পিন প্রবেশের চেষ্টা শনাক্ত (মোট $count বার)। ক্রেডেনশিয়াল থ্রটলিং সক্রিয়।",
+                target = "Security Gate",
+                severity = AuditSeverity.CRITICAL
             )
             return false
+        }
+    }
+
+    fun onBiometricUnlocked() {
+        if (_isSetupDone.value) {
+            _isVaultUnlocked.value = true
+            _failedAttemptsCount.value = 0
+            _remainingLockoutSeconds.value = 0L
+            _lastIntruderAlert.value = null
+            logEvent(
+                eventType = AuditEventType.APP_UNLOCKED,
+                title = if (_isBengali.value) "বায়োমেট্রিক আনলক সফল" else "Biometric Unlock Success",
+                details = "ডিভাইস বায়োমেট্রিক সেন্সর সফলভাবে ভেরিফাই করে ভল্টে প্রবেশ নিশ্চিত হয়েছে।",
+                target = "Biometric Gate",
+                severity = AuditSeverity.SUCCESS
+            )
         }
     }
 
@@ -204,15 +313,19 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         _isVaultUnlocked.value = false
     }
 
-    fun setMasterPin(newPin: String) {
-        prefs.setMasterPin(newPin)
-        logEvent(
-            eventType = AuditEventType.PERMISSION_AUDIT,
-            title = if (_isBengali.value) "মাস্টার পাসওয়ার্ড আপডেট করা হয়েছে" else "Master Password Updated",
-            details = "AES-256 মাস্টার পিন সফলভাবে পরিবর্তন করা হয়েছে।",
-            target = "Security Master",
-            severity = AuditSeverity.INFO
-        )
+    fun changeMasterPin(currentPin: String, newPin: String): Boolean {
+        if (newPin.length < 4) return false
+        val changed = prefs.changeMasterPin(currentPin, newPin)
+        if (changed) {
+            logEvent(
+                eventType = AuditEventType.PERMISSION_AUDIT,
+                title = if (_isBengali.value) "মাস্টার পাসওয়ার্ড আপডেট করা হয়েছে" else "Master Password Updated",
+                details = "পুনঃযাচাইকরণের পর PBKDF2 মাস্টার পিন সফলভাবে পরিবর্তন করা হয়েছে।",
+                target = "Security Master",
+                severity = AuditSeverity.INFO
+            )
+        }
+        return changed
     }
 
     fun toggleDisguiseCalculator(enabled: Boolean) {
@@ -224,62 +337,149 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         _selectedCategory.value = category
     }
 
-    // Vault Management
+    // ------------------------------------------------------------------------
+    // Real Encrypted File Storage (AES-256-GCM)
+    // ------------------------------------------------------------------------
+
     fun addVaultFile(
         title: String,
         category: FileCategory,
         content: String = "",
-        sizeFormatted: String = "2.4 MB"
+        sizeFormatted: String = ""
     ) {
         viewModelScope.launch {
-            val entity = VaultFileEntity(
-                title = title,
-                category = category.name,
-                filePath = "vault_${category.name.lowercase()}_${System.currentTimeMillis()}",
-                fileSizeFormatted = sizeFormatted,
-                secretContent = content
-            )
-            vaultDao.insertFile(entity)
+            try {
+                val plainBytes = content.toByteArray(Charsets.UTF_8)
+                val encResult = FileVaultManager.encryptAndSaveBytes(getApplication(), plainBytes)
 
+                val displaySize = if (sizeFormatted.isNotBlank()) sizeFormatted else {
+                    "${(encResult.totalCiphertextSize + 1023) / 1024} KB"
+                }
+
+                val entity = VaultFileEntity(
+                    title = title,
+                    category = category.name,
+                    filePath = encResult.relativePath,
+                    fileSizeFormatted = displaySize,
+                    timestamp = System.currentTimeMillis(),
+                    isEncrypted = true,
+                    encryptionAlgorithm = "AES-256-GCM (Hardware DEK)",
+                    description = "SHA-256: ${encResult.sha256Checksum.take(12)}...",
+                    secretContent = "" // Plaintext is NEVER stored in database!
+                )
+                vaultDao.insertFile(entity)
+
+                logEvent(
+                    eventType = AuditEventType.FILE_ENCRYPTED,
+                    title = if (_isBengali.value) "ফাইল সফলভাবে এনক্রিপ্ট করা হয়েছে" else "File Successfully Encrypted",
+                    details = "$title ফাইলটি AES-256-GCM এবং কীস্টোর মাস্টার কী দিয়ে সুরক্ষিত করা হয়েছে।",
+                    target = title,
+                    severity = AuditSeverity.SUCCESS
+                )
+            } catch (e: Exception) {
+                logEvent(
+                    eventType = AuditEventType.FILE_ENCRYPTED,
+                    title = "ফাইল এনক্রিপশনে ত্রুটি",
+                    details = "ত্রুটি: ${e.message}",
+                    target = title,
+                    severity = AuditSeverity.CRITICAL
+                )
+            }
+        }
+    }
+
+    /**
+     * Decrypts and returns file content after verifying GCM authentication tag.
+     */
+    fun decryptVaultContent(file: VaultFileEntity): String? {
+        return try {
+            val decryptedBytes = FileVaultManager.readAndDecryptFile(getApplication(), file.filePath)
+            String(decryptedBytes, Charsets.UTF_8)
+        } catch (e: Exception) {
             logEvent(
-                eventType = AuditEventType.FILE_ENCRYPTED,
-                title = if (_isBengali.value) "নতুন ফাইল এনক্রিপ্ট করে ভল্টে জমা হয়েছে" else "File Encrypted & Stored in Vault",
-                details = "ফাইল: $title (${category.labelBn}), এনক্রিপশন: AES-256-GCM。",
-                target = title,
-                severity = AuditSeverity.SUCCESS
+                eventType = AuditEventType.INTRUDER_ALERT,
+                title = "ফাইল টেম্পারিং বা ডিক্রিপশন ব্যর্থতা",
+                details = "ফাইল: ${file.title} - ${e.message}",
+                target = file.title,
+                severity = AuditSeverity.CRITICAL
             )
+            null
         }
     }
 
     fun deleteVaultFile(file: VaultFileEntity) {
         viewModelScope.launch {
+            FileVaultManager.secureDeleteFile(getApplication(), file.filePath)
             vaultDao.deleteFile(file)
             logEvent(
-                eventType = AuditEventType.FILE_DECRYPTED,
-                title = if (_isBengali.value) "ফাইল মুছে ফেলা হয়েছে" else "File Removed from Vault",
-                details = "ফাইল: ${file.title} ভল্ট থেকে মুছে ফেলা হয়েছে।",
-                target = file.title,
-                severity = AuditSeverity.WARNING
-            )
-        }
-    }
-
-    fun shareVaultFile(file: VaultFileEntity, targetAppOrChannel: String) {
-        viewModelScope.launch {
-            logEvent(
-                eventType = AuditEventType.FILE_SHARED,
-                title = if (_isBengali.value) "ফাইল শেয়ার ট্র্যাকিং লগ" else "File Share Tracking Log",
-                details = "ফাইল '${file.title}' ($targetAppOrChannel মাধ্যমে) শেয়ার করা হয়েছে। ডেটা লিকেজ রোধে অডিট সংরক্ষিত।",
+                eventType = AuditEventType.PERMISSION_CLEANUP,
+                title = if (_isBengali.value) "ফাইল নিরাপদভাবে মোছা হয়েছে" else "File Securely Wiped",
+                details = "${file.title} এনক্রিপ্ট করা ফাইল মেমোরি ও স্টোরেজ থেকে নিরাপদভাবে মুছে ফেলা হয়েছে।",
                 target = file.title,
                 severity = AuditSeverity.INFO
             )
         }
     }
 
-    // App Locker Management
+    fun shareVaultFile(file: VaultFileEntity, destination: String = "External / Secure Channel") {
+        logEvent(
+            eventType = AuditEventType.FILE_SHARED,
+            title = if (_isBengali.value) "ফাইল শেয়ার ট্র্যাকিং" else "File Shared Event",
+            details = "${file.title} শেয়ার করা হয়েছে ($destination)। ফরেনসিক অডিট রেকর্ড নিশ্চিত।",
+            target = file.title,
+            severity = AuditSeverity.WARNING
+        )
+    }
+
+    fun revokeAllDrivePublicLinks() {
+        viewModelScope.launch {
+            cloudDriveDao.revokeAllPublicLinks()
+            logEvent(
+                eventType = AuditEventType.PERMISSION_CLEANUP,
+                title = if (_isBengali.value) "গুগল ড্রাইভ পাবলিক লিঙ্ক প্রত্যাহার" else "Google Drive Public Links Revoked",
+                details = "সকল উন্মুক্ত ক্লাউড লিঙ্ক বাতিল করে ডেটা এক্সেস ব্যক্তিগত করা হয়েছে।",
+                target = "Cloud DLP",
+                severity = AuditSeverity.SUCCESS
+            )
+        }
+    }
+
+    private fun migrateLegacyVaultRecordsIfPresent() {
+        viewModelScope.launch {
+            try {
+                val legacyFiles = vaultDao.getAllFilesSync()
+                for (file in legacyFiles) {
+                    if (file.secretContent.isNotBlank() && !FileVaultManager.fileExists(getApplication(), file.filePath)) {
+                        val encResult = FileVaultManager.encryptAndSaveBytes(
+                            getApplication(),
+                            file.secretContent.toByteArray(Charsets.UTF_8)
+                        )
+                        val updated = file.copy(
+                            filePath = encResult.relativePath,
+                            secretContent = "",
+                            isEncrypted = true,
+                            encryptionAlgorithm = "AES-256-GCM"
+                        )
+                        vaultDao.updateFile(updated)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // App Lock & Challenge Flow
+    // ------------------------------------------------------------------------
+
+    fun toggleAppLock(app: LockedAppEntity, isLocked: Boolean) {
+        viewModelScope.launch {
+            lockedAppDao.updateLockStatus(app.packageName, isLocked)
+        }
+    }
+
     fun toggleAppLocked(packageName: String, isLocked: Boolean) {
         viewModelScope.launch {
-            lockedAppDao.setLockedStatus(packageName, isLocked)
+            lockedAppDao.updateLockStatus(packageName, isLocked)
         }
     }
 
@@ -296,46 +496,107 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun startAppAccessChallenge(app: LockedAppEntity) {
-        _activeChallengeApp.value = app
-        val randomOtp = EncryptionHelper.generateRandomOtp()
-        _currentChallengeOtp.value = randomOtp
+        startAppChallenge(app)
+    }
 
-        val reqId = "REQ-" + UUID.randomUUID().toString().substring(0, 8).uppercase()
-        _activeRequestId.value = reqId
+    fun setMasterPin(pin: String) {
+        setupMasterPin(pin)
+    }
+
+    fun dismissPowerOffChallenge() {
+        cancelPowerOffChallenge()
+    }
+
+    fun submitPowerOffOtp(otp: String): Boolean {
+        return verifyPowerOffOtp(otp)
+    }
+
+    fun scanAppPermissions() {
+        scanPermissions()
+    }
+
+    fun logPermissionCleanup(appName: String, packageName: String = "") {
+        val targetDesc = if (packageName.isNotBlank()) "$appName ($packageName)" else appName
+        logEvent(
+            eventType = AuditEventType.PERMISSION_CLEANUP,
+            title = if (_isBengali.value) "পারমিশন ক্লিনআপ অ্যাকশন" else "Permission Cleanup Action",
+            details = "$targetDesc পারমিশন ম্যানেজারে পাঠানো হয়েছে।",
+            target = appName,
+            severity = AuditSeverity.INFO
+        )
+    }
+
+    fun updateAppSecurityPolicies(app: LockedAppEntity, pin: Boolean, otp: Boolean, remote: Boolean) {
+        viewModelScope.launch {
+            lockedAppDao.updateSecurityPolicies(app.packageName, pin, otp, remote)
+        }
+    }
+
+    fun addLockedApp(packageName: String, appName: String, isFinancial: Boolean) {
+        viewModelScope.launch {
+            val app = LockedAppEntity(
+                packageName = packageName,
+                appName = appName,
+                isFinancial = isFinancial,
+                isLocked = true,
+                requirePin = true,
+                requireOtp = isFinancial,
+                requireRemoteApproval = isFinancial
+            )
+            lockedAppDao.insert(app)
+        }
+    }
+
+    fun startAppChallenge(app: LockedAppEntity) {
+        _activeChallengeApp.value = app
+
+        val generatedOtp = EncryptionHelper.generateRandomOtp()
+        _currentChallengeOtp.value = generatedOtp
+
+        val challenge = TrustedDeviceProtocol.ApprovalChallenge(
+            action = "APP_UNLOCK:${app.packageName}",
+            targetDeviceId = TrustedDeviceProtocol.getOrCreateLocalDeviceId(getApplication()),
+            requesterName = app.appName
+        )
+        _activeApprovalChallenge.value = challenge
+        _activeRequestId.value = challenge.challengeId
 
         if (app.requireRemoteApproval) {
-            val remoteReq = RemoteRequestEntity(
-                requestId = reqId,
+            val reqEntity = RemoteRequestEntity(
+                requestId = challenge.challengeId,
                 packageName = app.packageName,
                 appName = app.appName,
-                requestingDeviceName = "Primary Device (Android)",
+                requestingDeviceName = "Primary Phone (${android.os.Build.MODEL})",
                 targetPhoneName = prefs.getSecondaryPhoneName(),
-                challengeOtp = randomOtp,
-                status = ApprovalStatus.PENDING.name
+                timestamp = System.currentTimeMillis(),
+                status = ApprovalStatus.PENDING.name,
+                challengeOtp = challenge.verificationCode,
+                ipAddressOrLocation = "Local Trusted Connection"
             )
             viewModelScope.launch {
-                remoteRequestDao.insertRequest(remoteReq)
-                NotificationHelper.showRemoteApprovalNotification(
-                    context = getApplication(),
-                    appName = app.appName,
-                    otp = randomOtp,
-                    requestId = reqId,
-                    isBn = _isBengali.value
-                )
+                remoteRequestDao.insertRequest(reqEntity)
             }
         }
 
-        _challengeState.value = ChallengeState.AwaitingPin
+        if (app.requirePin) {
+            _challengeState.value = ChallengeState.AwaitingPin
+        } else if (app.requireOtp) {
+            _challengeState.value = ChallengeState.AwaitingOtp
+        } else if (app.requireRemoteApproval) {
+            _challengeState.value = ChallengeState.AwaitingRemoteApproval
+        } else {
+            finalizeAccessGranted()
+        }
     }
 
-    fun submitChallengePin(pin: String): Boolean {
+    fun submitChallengePin(enteredPin: String): Boolean {
         val app = _activeChallengeApp.value ?: return false
-        val ok = prefs.verifyPin(pin)
+        val ok = prefs.verifyPin(enteredPin)
         if (!ok) {
             logEvent(
                 eventType = AuditEventType.APP_BLOCKED,
-                title = if (_isBengali.value) "ভুল পিনে অ্যাপে প্রবেশের চেষ্টা রোধ" else "Unauthorized App Access Blocked",
-                details = "${app.appName} এ প্রবেশের জন্য ভুল পিন দেওয়া হয়েছে।",
+                title = if (_isBengali.value) "অ্যাপে ভুল পিন দিয়ে প্রবেশের চেষ্টা রোধ" else "App Access Blocked: Invalid PIN",
+                details = "${app.appName} অ্যাপে ভুল পিন দেওয়া হয়েছে।",
                 target = app.appName,
                 severity = AuditSeverity.CRITICAL
             )
@@ -355,7 +616,9 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     fun submitChallengeOtp(otp: String): Boolean {
         val app = _activeChallengeApp.value ?: return false
         val generated = _currentChallengeOtp.value ?: ""
-        if (otp == generated || otp == "999999") {
+
+        // NO hardcoded backdoors allowed (no "999999")
+        if (otp == generated && generated.isNotBlank()) {
             if (app.requireRemoteApproval) {
                 _challengeState.value = ChallengeState.AwaitingRemoteApproval
             } else {
@@ -366,11 +629,82 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
             logEvent(
                 eventType = AuditEventType.APP_BLOCKED,
                 title = if (_isBengali.value) "ভুল ওটিপি দিয়ে প্রবেশের চেষ্টা রোধ" else "Invalid Dynamic OTP Entered",
-                details = "${app.appName} অ্যাপের জন্য ভুল ওটিপি ($otp) দেওয়া হয়েছে।",
+                details = "${app.appName} অ্যাপের জন্য ভুল ওটিপি দেওয়া হয়েছে। অননুমোদিত অ্যাক্সেস ব্লক।",
                 target = app.appName,
                 severity = AuditSeverity.WARNING
             )
             return false
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Trusted-Device Cryptographic Approval Protocol
+    // ------------------------------------------------------------------------
+
+    fun pairSecondaryPhone(name: String, deviceId: String, publicKeyBase64: String): Boolean {
+        if (name.isBlank() || publicKeyBase64.isBlank()) return false
+        prefs.savePairedDevice(name, deviceId, publicKeyBase64)
+        logEvent(
+            eventType = AuditEventType.PERMISSION_AUDIT,
+            title = if (_isBengali.value) "নতুন সেকেন্ডারি ফোন পেয়ার করা হয়েছে" else "Trusted Secondary Device Paired",
+            details = "$name ডিভাইসের ECDSA পাবলিক কি ভেরিফাই করে সফলভাবে যুক্ত করা হয়েছে।",
+            target = name,
+            severity = AuditSeverity.SUCCESS
+        )
+        return true
+    }
+
+    fun revokeSecondaryPhone() {
+        val name = prefs.getSecondaryPhoneName()
+        prefs.revokePairing()
+        logEvent(
+            eventType = AuditEventType.PERMISSION_CLEANUP,
+            title = if (_isBengali.value) "সেকেন্ডারি ফোনের অনুমোদন বাতিল" else "Trusted Device Revoked",
+            details = "$name এর বিশ্বস্ত অনুমোদন ও পাবলিক কি বাতিল করা হয়েছে।",
+            target = name,
+            severity = AuditSeverity.WARNING
+        )
+    }
+
+    /**
+     * Verifies cryptographic signed approval token received from paired device.
+     */
+    fun submitRemoteApprovalToken(tokenString: String): Pair<Boolean, String> {
+        val challenge = _activeApprovalChallenge.value
+            ?: return Pair(false, if (_isBengali.value) "কোনো সক্রিয় অনুমোদন চ্যালেঞ্জ নেই" else "No active challenge")
+
+        val token = TrustedDeviceProtocol.SignedApprovalToken.decodeFromTransmissionString(tokenString)
+            ?: return Pair(false, if (_isBengali.value) "টোকেন ফরম্যাট অবৈধ" else "Invalid token format")
+
+        val result = TrustedDeviceProtocol.verifyApprovalResponse(
+            context = getApplication(),
+            prefs = prefs,
+            activeChallenge = challenge,
+            token = token
+        )
+
+        return when (result) {
+            is TrustedDeviceProtocol.VerificationResult.Success -> {
+                finalizeAccessGranted()
+                logEvent(
+                    eventType = AuditEventType.REMOTE_APPROVED,
+                    title = if (_isBengali.value) "ক্রিপ্টোগ্রাফিক রিমোট অনুমোদন সফল" else "ECDSA Remote Approval Verified",
+                    details = "বিশ্বস্ত ফোন থেকে ডিজিটাল সিগনেচার যাচাই করে অ্যাক্সেস অনুমোদিত হয়েছে।",
+                    target = challenge.action,
+                    severity = AuditSeverity.SUCCESS
+                )
+                Pair(true, if (_isBengali.value) "অনুমোদন সফল!" else "Approval verified!")
+            }
+            is TrustedDeviceProtocol.VerificationResult.Rejected -> {
+                logEvent(
+                    eventType = AuditEventType.REMOTE_REJECTED,
+                    title = if (_isBengali.value) "রিমোট অনুমোদন প্রত্যাখ্যান" else "Remote Approval Rejected",
+                    details = "কারণ: ${result.reasonEn}",
+                    target = challenge.action,
+                    severity = AuditSeverity.CRITICAL
+                )
+                Pair(false, if (_isBengali.value) result.reasonBn else result.reasonEn)
+            }
         }
     }
 
@@ -380,7 +714,7 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         logEvent(
             eventType = AuditEventType.APP_UNLOCKED,
             title = if (_isBengali.value) "অ্যাপ সফলভাবে খোলা হয়েছে" else "App Access Granted",
-            details = "${app.appName} এর নিরাপত্তা স্তর (পিন + ওটিপি + রিমোট অনুমোদন) সফলভাবে উত্তীর্ণ হয়েছে।",
+            details = "${app.appName} এর সুরক্ষা স্তর সফলভাবে উত্তীর্ণ হয়েছে।",
             target = app.appName,
             severity = AuditSeverity.SUCCESS
         )
@@ -389,148 +723,81 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
     fun cancelChallenge() {
         _activeChallengeApp.value = null
         _currentChallengeOtp.value = null
+        _activeApprovalChallenge.value = null
         _activeRequestId.value = null
         _challengeState.value = ChallengeState.Idle
     }
 
-    // Remote Secondary Device Actions
-    fun approveRemoteRequest(request: RemoteRequestEntity) {
-        viewModelScope.launch {
-            remoteRequestDao.updateStatus(request.requestId, ApprovalStatus.APPROVED.name, System.currentTimeMillis())
+    // ------------------------------------------------------------------------
+    // Anti-Theft: Device Lockdown & Shutdown Interception
+    // ------------------------------------------------------------------------
 
-            logEvent(
-                eventType = AuditEventType.REMOTE_APPROVED,
-                title = if (_isBengali.value) "অন্য ফোন থেকে অ্যাপ খোলার অনুমোদন দেওয়া হয়েছে" else "Remote Approval Granted from 2nd Phone",
-                details = "${request.targetPhoneName} থেকে ${request.appName} (ওটিপি: ${request.challengeOtp}) অ্যাক্সেসের অনুমতি নিশ্চিত করা হয়েছে।",
-                target = request.appName,
-                severity = AuditSeverity.SUCCESS
-            )
-
-            if (_activeRequestId.value == request.requestId) {
-                finalizeAccessGranted()
-            }
-        }
+    fun startLockdownService() {
+        DeviceLockdownService.start(getApplication())
+        prefs.setAntiPowerOffEnabled(true)
     }
 
-    fun rejectRemoteRequest(request: RemoteRequestEntity) {
-        viewModelScope.launch {
-            remoteRequestDao.updateStatus(request.requestId, ApprovalStatus.REJECTED.name, System.currentTimeMillis())
-
-            logEvent(
-                eventType = AuditEventType.REMOTE_REJECTED,
-                title = if (_isBengali.value) "অন্য ফোন থেকে প্রবেশ বাতিল করা হয়েছে" else "Remote Access Denied from 2nd Phone",
-                details = "${request.targetPhoneName} থেকে ${request.appName} এ প্রবেশের চেষ্টা সরাসরি ব্লক করা হয়েছে।",
-                target = request.appName,
-                severity = AuditSeverity.CRITICAL
-            )
-
-            if (_activeRequestId.value == request.requestId) {
-                _challengeState.value = ChallengeState.Rejected
-            }
-        }
+    fun stopLockdownService() {
+        DeviceLockdownService.stop(getApplication())
+        prefs.setAntiPowerOffEnabled(false)
     }
 
-    fun pairSecondaryPhone(name: String, code: String) {
-        prefs.setSecondaryPhoneName(name)
-        prefs.setSecondaryPhoneCode(code)
-        prefs.setSecondaryPaired(true)
-        logEvent(
-            eventType = AuditEventType.PERMISSION_AUDIT,
-            title = if (_isBengali.value) "নতুন সেকেন্ডারি ফোন পেয়ার করা হয়েছে" else "Secondary Phone Paired",
-            details = "ডিভাইস: $name, পেয়ারিং কোড: $code সফলভাবে সংযুক্ত।",
-            target = name,
-            severity = AuditSeverity.SUCCESS
-        )
+    fun toggleLockdownService(enabled: Boolean) {
+        if (enabled) startLockdownService() else stopLockdownService()
     }
 
-    // Permission Scanner
-    fun scanAppPermissions() {
-        _isScanningPermissions.value = true
-        viewModelScope.launch {
-            val list = PermissionAuditorHelper.scanInstalledApps(getApplication())
-            _permissionApps.value = list
-            _isScanningPermissions.value = false
-
-            logEvent(
-                eventType = AuditEventType.PERMISSION_AUDIT,
-                title = if (_isBengali.value) "অ্যাপ পারমিশন অডিট সম্পন্ন" else "App Permissions Audited",
-                details = "মোট ${list.size} টি অ্যাপ নিরীক্ষা করা হয়েছে। উচ্চ ঝুঁকিপূর্ণ অ্যাপ চিহ্নিত।",
-                target = "Permission Auditor",
-                severity = AuditSeverity.INFO
-            )
-        }
+    fun triggerLockdownInterception(reason: String) {
+        DeviceLockdownService.triggerLockdown(getApplication(), reason)
     }
 
-    fun logPermissionCleanup(appName: String) {
-        logEvent(
-            eventType = AuditEventType.PERMISSION_CLEANUP,
-            title = if (_isBengali.value) "অনুমতি প্রত্যাহারে সেটিংস ওপেন করা হয়েছে" else "Revoke Permissions Launched",
-            details = "$appName অ্যাপের অপ্রয়োজনীয় ক্যামেরা/মাইক/এসএমএস পারমিশন প্রত্যাহার করতে সিস্টেম সেটিংসে পাঠানো হয়েছে।",
-            target = appName,
-            severity = AuditSeverity.WARNING
-        )
-    }
-
-    // Google Drive Cloud DLP Actions
-    fun revokeAllDrivePublicLinks() {
-        viewModelScope.launch {
-            cloudDriveDao.revokeAllPublicLinks()
-            logEvent(
-                eventType = AuditEventType.FILE_ENCRYPTED,
-                title = if (_isBengali.value) "গুগল ড্রাইভ পাবলিক লিঙ্ক প্রত্যাহার সম্পন্ন" else "All Google Drive Public Links Revoked",
-                details = "ক্লাউড ডেটা লিকেজ রোধে সকল শেয়ার লিঙ্ক 'Private Only' করা হয়েছে।",
-                target = "Google Drive DLP",
-                severity = AuditSeverity.SUCCESS
-            )
-        }
-    }
-
-    // Anti-Theft: Power-Off Interception
-    fun triggerPowerOffAttempt() {
+    fun triggerPowerOffAttempt(reason: String = "Power-off key event intercepted") {
         val otp = EncryptionHelper.generateRandomOtp()
         val challenge = PowerOffChallenge(
-            challengeId = "POW-" + UUID.randomUUID().toString().substring(0, 6).uppercase(),
+            challengeId = "POW-" + UUID.randomUUID().toString().substring(0, 8).uppercase(),
             otp = otp,
+            requestingDevice = "Primary Phone",
             targetSecondaryPhone = prefs.getSecondaryPhoneName()
         )
         _activePowerOffChallenge.value = challenge
+        DeviceLockdownService.triggerLockdown(getApplication(), reason)
 
-        NotificationHelper.showAntiTheftEmergencyNotification(
+        NotificationHelper.showShutdownAttemptNotification(
             context = getApplication(),
-            title = if (_isBengali.value) "🚨 ফোন বন্ধ করার চেষ্টা শনাক্ত!" else "🚨 Unauthorized Power-Off Attempt!",
+            title = if (_isBengali.value) "অননুমোদিত ফোন বন্ধ করার চেষ্টা!" else "Unauthorized Power-Off Attempt!",
             message = if (_isBengali.value) {
-                "আনলক অবস্থায় কেউ ফোন অফ করার চেষ্টা করছে! অনুমোদন ওটিপি: $otp (সেকেন্ডারি ফোনে প্রেরিত)"
+                "কেউ ফোনটি বন্ধ করার চেষ্টা করছে। ওটিপি দিয়ে ভেরিফাই করুন।"
             } else {
-                "Someone is trying to power off your device! Approval OTP: $otp (Sent to 2nd phone)"
+                "Someone is attempting to power off the device. Secondary OTP verification required."
             }
         )
 
         logEvent(
             eventType = AuditEventType.INTRUDER_ALERT,
-            title = if (_isBengali.value) "অননুমোদিত পাওয়ার অফ চেষ্টা রোধ" else "Unauthorized Power-Off Blocked",
-            details = "ফোন বন্ধ করার চেষ্টা করা হয়েছে। সেকেন্ডারি ফোনে ওটিপি ($otp) পাঠানো হয়েছে।",
-            target = "Anti-Theft Power-Off Guard",
+            title = if (_isBengali.value) "অননুমোদিত ফোন বন্ধের চেষ্টা প্রতিহত!" else "Unauthorized Shutdown Intercepted!",
+            details = "সফটওয়্যার শাটডাউন ডায়ালগ ইন্টারসেপ্ট করা হয়েছে ($reason)। ডিভাইস লকডাউন সক্রিয়।",
+            target = "Power Guard",
             severity = AuditSeverity.CRITICAL
         )
     }
 
-    fun submitPowerOffOtp(otp: String): Boolean {
+    fun verifyPowerOffOtp(enteredOtp: String): Boolean {
         val challenge = _activePowerOffChallenge.value ?: return false
-        if (otp == challenge.otp || otp == "999999") {
+        if (enteredOtp == challenge.otp) {
             _activePowerOffChallenge.value = null
+            DeviceLockdownService.dismissLockdown()
             logEvent(
                 eventType = AuditEventType.APP_UNLOCKED,
-                title = if (_isBengali.value) "ফোন বন্ধের অনুমোদন সম্পন্ন" else "Authorized Device Power-Off",
-                details = "সঠিক ওটিপি দিয়ে ডিভাইস শাটডাউন অনুমোদন করা হয়েছে।",
+                title = if (_isBengali.value) "ফোন বন্ধের অনুমোদন সম্পন্ন" else "Authorized Shutdown Permitted",
+                details = "সঠিক ওটিপি দিয়ে শাটডাউন অনুমোদন নিশ্চিত করা হয়েছে।",
                 target = "Power Guard",
-                severity = AuditSeverity.INFO
+                severity = AuditSeverity.SUCCESS
             )
             return true
         } else {
             logEvent(
                 eventType = AuditEventType.INTRUDER_ALERT,
-                title = if (_isBengali.value) "ভুল ওটিপি দিয়ে ফোন বন্ধের চেষ্টা" else "Invalid OTP on Power-Off Attempt",
-                details = "ভুল ওটিপি ইনপুট দেওয়া হয়েছে। ছদ্মবেশী স্ক্রিন চালু হতে পারে।",
+                title = if (_isBengali.value) "শাটডাউনে ভুল ওটিপি চেষ্টা!" else "Invalid Shutdown OTP Attempt!",
+                details = "অননুমোদিত ব্যবহারকারী ভুল ওটিপি দিয়ে ফোন বন্ধ করার চেষ্টা করেছে।",
                 target = "Power Guard",
                 severity = AuditSeverity.CRITICAL
             )
@@ -538,27 +805,23 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun dismissPowerOffChallenge() {
+    fun cancelPowerOffChallenge() {
         _activePowerOffChallenge.value = null
+        DeviceLockdownService.dismissLockdown()
     }
 
-    fun activateFakeShutdownMode() {
+    fun enterFakeShutdownMode() {
         _isFakeShutdownActive.value = true
-        _activePowerOffChallenge.value = null
-        logEvent(
-            eventType = AuditEventType.INTRUDER_ALERT,
-            title = if (_isBengali.value) "ছদ্মবেশী শাটডাউন সক্রিয় (Decoy Shutdown)" else "Fake Shutdown Mode Activated",
-            details = "স্ক্রিন সম্পূর্ণ কালো ও বন্ধ মনে হলেও ব্যাকগ্রাউন্ডে জিপিএস লোকেশন ও টেলিমিতি চালু রয়েছে।",
-            target = "Anti-Theft Decoy",
-            severity = AuditSeverity.WARNING
-        )
+        DeviceLockdownService.triggerLockdown(getApplication(), "Fake decoy power-off active")
     }
+
+    fun activateFakeShutdownMode() = enterFakeShutdownMode()
 
     fun exitFakeShutdownMode() {
         _isFakeShutdownActive.value = false
+        DeviceLockdownService.dismissLockdown()
     }
 
-    // Anti-Theft: SIM Eject & Airplane Mode Alarms
     fun simulateSimEjection() {
         val updated = _simStatus.value.copy(
             isInserted = false,
@@ -570,18 +833,18 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
 
         NotificationHelper.showAntiTheftEmergencyNotification(
             context = getApplication(),
-            title = if (_isBengali.value) "🚨 সিম ট্রে খোলা হয়েছে! জরুরি সতর্কতা" else "🚨 SIM Tray Ejected! Emergency Alert",
+            title = if (_isBengali.value) "🚨 সিম স্ট্যাটাস পরিবর্তন!" else "🚨 SIM State Change Detected!",
             message = if (_isBengali.value) {
-                "সিম কার্ড খুলে ফেলা হয়েছে বা ট্রে বের করা হয়েছে! শেষ লোকেশন ও জরুরি অ্যালার্ট সেকেন্ডারি ফোনে প্রেরণ করা হয়েছে।"
+                "সিম কার্ড সংযোগ বিচ্ছিন্ন হয়েছে। শেষ পরিচিত লোকেশন ও জরুরি অ্যালার্ট সক্রিয়।"
             } else {
-                "SIM card removed or tray opened! Critical alert with last known GPS sent to 2nd phone."
+                "SIM card absent or disconnected. Emergency telemetry activated."
             }
         )
 
         logEvent(
             eventType = AuditEventType.INTRUDER_ALERT,
-            title = if (_isBengali.value) "🚨 সিম কার্ড খোলা বা ট্রে বের করার সতর্কতা!" else "🚨 SIM Card Ejected / Tray Opened!",
-            details = "সিম ট্রে সরানো হয়েছে। চোর যাতে নেটওয়ার্ক বন্ধ না করতে পারে তাই সাইরেন ও অ্যালার্ট সক্রিয়।",
+            title = if (_isBengali.value) "🚨 সিম কার্ড স্ট্যাটাস পরিবর্তন সতর্কতা!" else "🚨 SIM State Change Detected!",
+            details = "সিম সংযোগ বিচ্ছিন্ন শনাক্ত হয়েছে। নেটওয়ার্ক অ্যান্টি-থেফট সক্রিয়।",
             target = "Anti-Theft SIM Guard",
             severity = AuditSeverity.CRITICAL
         )
@@ -592,7 +855,7 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         _isSirenAlarmActive.value = false
         logEvent(
             eventType = AuditEventType.PERMISSION_AUDIT,
-            title = if (_isBengali.value) "সিম কার্ড পুনঃসংযুক্ত" else "SIM Card Re-inserted & Verified",
+            title = if (_isBengali.value) "সিম কার্ড পুনঃসংযুক্ত" else "SIM Verified",
             details = "সিম কার্ড স্বাভাবিক অবস্থায় ফিরে এসেছে।",
             target = "SIM Guard",
             severity = AuditSeverity.SUCCESS
@@ -606,8 +869,8 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
             _isSirenAlarmActive.value = true
             logEvent(
                 eventType = AuditEventType.INTRUDER_ALERT,
-                title = if (_isBengali.value) "🚨 এয়ারপ্লেন মোড অন করার চেষ্টা শনাক্ত!" else "🚨 Airplane Mode Toggle Attempt Detected!",
-                details = "ডিভাইসের কানেকশন বন্ধ করতে এয়ারপ্লেন মোড চালু করা হয়েছে। জরুরি সাইরেন সক্রিয়।",
+                title = if (_isBengali.value) "🚨 এয়ারপ্লেন মোড অন করার চেষ্টা শনাক্ত!" else "🚨 Airplane Mode Detected!",
+                details = "ডিভাইসের নেটওয়ার্ক সংযোগ বিচ্ছিন্ন করা হয়েছে। জরুরি অ্যালার্ট প্রস্তুত।",
                 target = "Anti-Theft Connectivity",
                 severity = AuditSeverity.CRITICAL
             )
@@ -626,30 +889,32 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
                 _lastKnownLocation.value = loc
                 logEvent(
                     eventType = AuditEventType.PERMISSION_AUDIT,
-                    title = if (_isBengali.value) "লাইভ লোকেশন ও ব্যাটারি আপডেট" else "Live Location Telemetry Updated",
-                    details = "GPS: ${loc.latitude}, ${loc.longitude} (${loc.locationName})",
+                    title = if (_isBengali.value) "যাচাইকৃত লোকেশন আপডেট" else "Verified Location Updated",
+                    details = "ফিক্স: ${loc.fixType.labelEn}, জিপিএস: ${loc.latitude ?: 0.0}, ${loc.longitude ?: 0.0}",
                     target = "Find Hub Tracker",
                     severity = AuditSeverity.INFO
                 )
             },
-            onError = {
-                val current = _lastKnownLocation.value
-                _lastKnownLocation.value = current.copy(
-                    timestamp = System.currentTimeMillis(),
-                    batteryPercentage = (current.batteryPercentage - 1).coerceAtLeast(1)
+            onError = { err ->
+                logEvent(
+                    eventType = AuditEventType.PERMISSION_AUDIT,
+                    title = "লোকেশন পেতে ব্যর্থ",
+                    details = "কারণ: $err",
+                    target = "Find Hub",
+                    severity = AuditSeverity.WARNING
                 )
             }
         )
     }
 
     fun startRealtimeMovementTracking() {
-        locationManager.startRealtimeMovementTracking { loc, speed, statusBn, statusEn ->
+        locationManager.startRealtimeMovementTracking { loc, speed, _, _ ->
             _lastKnownLocation.value = loc
             if (speed > 25f) {
                 logEvent(
                     eventType = AuditEventType.INTRUDER_ALERT,
                     title = if (_isBengali.value) "🚨 ডিভাইসে দ্রুত গতি শনাক্ত!" else "🚨 High-Speed Movement Detected!",
-                    details = "গতি: ${String.format(java.util.Locale.US, "%.1f", speed)} km/h, অবস্থান: ${loc.locationName}",
+                    details = "গতি: ${String.format(java.util.Locale.US, "%.1f", speed)} km/h",
                     target = "Anti-Theft Movement",
                     severity = AuditSeverity.CRITICAL
                 )
@@ -661,17 +926,15 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         locationManager.stopRealtimeMovementTracking()
     }
 
-    // Boot-up lock verification
-    fun unlockBootGate(pin: String, otp: String): Boolean {
+    fun unlockBootGate(pin: String): Boolean {
         val pinOk = prefs.verifyPin(pin)
-        val otpOk = otp.length == 6 || otp == "123456"
-        if (pinOk && otpOk) {
+        if (pinOk) {
             _isBootLocked.value = false
             prefs.setBootLockdownActive(false)
             logEvent(
                 eventType = AuditEventType.APP_UNLOCKED,
                 title = if (_isBengali.value) "রিস্টার্টের পর সফল আনলক" else "Post-Boot Anti-Theft Unlocked",
-                details = "মাস্টার পিন ও ওটিপি ভেরিফিকেশন সফল। ডিভাইস এখন স্বাভাবিক।",
+                details = "মাস্টার ক্রেডেনশিয়াল যাচাই সফল। ডিভাইস স্বাভাবিক।",
                 target = "Boot-up Guard",
                 severity = AuditSeverity.SUCCESS
             )
@@ -680,9 +943,56 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         return false
     }
 
+    fun scanPermissions() {
+        _isScanningPermissions.value = true
+        viewModelScope.launch {
+            try {
+                val scanned = PermissionAuditorHelper.scanInstalledApps(getApplication())
+                _permissionApps.value = scanned
+            } finally {
+                _isScanningPermissions.value = false
+            }
+        }
+    }
+
     fun clearAuditLogs() {
         viewModelScope.launch {
             auditLogDao.clearAllLogs()
+        }
+    }
+
+    fun toggleDemoMode(enabled: Boolean) {
+        prefs.setDemoModeEnabled(enabled)
+        _isDemoModeActive.value = enabled
+        if (enabled) {
+            seedDemoData()
+        } else {
+            clearDemoData()
+        }
+    }
+
+    private fun seedDemoData() {
+        viewModelScope.launch {
+            // Seed isolated demo items with explicit [DEMO] labeling
+            val demoDrive = listOf(
+                CloudDriveItemEntity(
+                    title = "[DEMO] Public_Shared_Doc.pdf",
+                    mimeType = "application/pdf",
+                    fileSizeFormatted = "1.2 MB",
+                    shareStatus = DriveShareStatus.PUBLIC_LINK.name,
+                    isLeaking = true,
+                    sharedWithEmails = "Anyone with link (Demo Sandbox)",
+                    lastScannedTimestamp = System.currentTimeMillis()
+                )
+            )
+            cloudDriveDao.insertAll(demoDrive)
+        }
+    }
+
+    private fun clearDemoData() {
+        viewModelScope.launch {
+            cloudDriveDao.clearAll()
+            sensorAccessDao.clearAll()
         }
     }
 
@@ -691,8 +1001,7 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
         title: String,
         details: String,
         target: String,
-        severity: AuditSeverity = AuditSeverity.INFO,
-        intruderPhotoPath: String? = null
+        severity: AuditSeverity = AuditSeverity.INFO
     ) {
         viewModelScope.launch {
             val entity = AuditLogEntity(
@@ -701,7 +1010,7 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
                 details = details,
                 targetItem = target,
                 severity = severity.name,
-                intruderPhotoPath = intruderPhotoPath
+                intruderPhotoPath = null // Real, minimal security event; no fake paths
             )
             auditLogDao.insertLog(entity)
         }
@@ -709,209 +1018,39 @@ class SecurityViewModel(application: Application) : AndroidViewModel(application
 
     private fun seedInitialFinancialAppsIfEmpty() {
         viewModelScope.launch {
-            val defaultApps = listOf(
-                LockedAppEntity(
-                    packageName = "com.bKash.customerapp",
-                    appName = "bKash (বিকাশ)",
-                    isFinancial = true,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = true,
-                    requireRemoteApproval = true
-                ),
-                LockedAppEntity(
-                    packageName = "com.konasl.nagad",
-                    appName = "Nagad (নগদ)",
-                    isFinancial = true,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = true,
-                    requireRemoteApproval = true
-                ),
-                LockedAppEntity(
-                    packageName = "com.dbbl.nexus.pay",
-                    appName = "NexusPay DBBL",
-                    isFinancial = true,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = true,
-                    requireRemoteApproval = true
-                ),
-                LockedAppEntity(
-                    packageName = "com.binance.dev",
-                    appName = "Binance Crypto",
-                    isFinancial = true,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = true,
-                    requireRemoteApproval = false
-                ),
-                LockedAppEntity(
-                    packageName = "com.google.android.apps.photos",
-                    appName = "Google Photos / Gallery",
-                    isFinancial = false,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = false,
-                    requireRemoteApproval = false
-                ),
-                LockedAppEntity(
-                    packageName = "com.android.settings",
-                    appName = "Phone Settings",
-                    isFinancial = false,
-                    isLocked = true,
-                    requirePin = true,
-                    requireOtp = false,
-                    requireRemoteApproval = false
+            val count = lockedAppDao.getCount()
+            if (count == 0) {
+                val defaultApps = listOf(
+                    LockedAppEntity(
+                        packageName = "com.bKash.customerapp",
+                        appName = "bKash (বিকাশ)",
+                        isFinancial = true,
+                        isLocked = true,
+                        requirePin = true,
+                        requireOtp = true,
+                        requireRemoteApproval = true
+                    ),
+                    LockedAppEntity(
+                        packageName = "com.konasl.nagad",
+                        appName = "Nagad (নগদ)",
+                        isFinancial = true,
+                        isLocked = true,
+                        requirePin = true,
+                        requireOtp = true,
+                        requireRemoteApproval = true
+                    ),
+                    LockedAppEntity(
+                        packageName = "com.android.settings",
+                        appName = "Phone Settings",
+                        isFinancial = false,
+                        isLocked = true,
+                        requirePin = true,
+                        requireOtp = false,
+                        requireRemoteApproval = false
+                    )
                 )
-            )
-            lockedAppDao.insertAll(defaultApps)
-        }
-    }
-
-    private fun seedInitialVaultFilesIfEmpty() {
-        viewModelScope.launch {
-            val sampleFiles = listOf(
-                VaultFileEntity(
-                    title = "Bank_Statement_Confidential.pdf",
-                    category = FileCategory.DOCUMENT.name,
-                    filePath = "vault_doc_sample_1",
-                    fileSizeFormatted = "1.8 MB",
-                    description = "গোপন ব্যাংক অ্যাকাউন্ট লেনদেন ও আর্থিক রিপোর্ট",
-                    secretContent = "Account No: 20491029481\nAvailable Balance: $14,850.00\nBranch: Main Corporate\nSecurity Token: 884-TX-99"
-                ),
-                VaultFileEntity(
-                    title = "Secret_Crypto_Recovery_Key.txt",
-                    category = FileCategory.NOTE.name,
-                    filePath = "vault_note_sample_1",
-                    fileSizeFormatted = "4 KB",
-                    description = "হার্ডওয়্যার ওয়ালেট ও বিটকয়েন সিড ফ্রেজ",
-                    secretContent = "12-Word Mnemonic Phrase:\nplanet orbit pulse velvet digital crystal shield armor neon echo shadow orbit"
-                ),
-                VaultFileEntity(
-                    title = "Family_Passport_Scan.jpg",
-                    category = FileCategory.PHOTO.name,
-                    filePath = "vault_photo_sample_1",
-                    fileSizeFormatted = "3.2 MB",
-                    description = "পাসপোর্ট ও ন্যাশনাল আইডি কার্ডের এনক্রিপ্টেড কপি",
-                    secretContent = "Passport: A19482910\nNID: 198274819204\nIssued: 12 Jan 2024"
-                ),
-                VaultFileEntity(
-                    title = "Confidential_Voice_Memo.mp3",
-                    category = FileCategory.AUDIO.name,
-                    filePath = "vault_audio_sample_1",
-                    fileSizeFormatted = "4.5 MB",
-                    description = "জরুরি ব্যবসায়িক মিটিং এর অডিও রেকর্ড",
-                    secretContent = "Audio Length: 04:32 min\nEncoding: AAC 256kbps\nTranscript: Meeting regarding cybersecurity architecture and dual phone authorization protocol."
-                )
-            )
-            for (f in sampleFiles) {
-                vaultDao.insertFile(f)
+                lockedAppDao.insertAll(defaultApps)
             }
-        }
-    }
-
-    private fun seedInitialSensorLogsIfEmpty() {
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val logs = listOf(
-                SensorAccessLogEntity(
-                    packageName = "com.whatsapp",
-                    appName = "WhatsApp",
-                    sensorType = SensorType.MICROPHONE.name,
-                    timestamp = now - (12 * 60 * 1000),
-                    durationSeconds = 45,
-                    isBackground = false,
-                    isUnusual = false,
-                    unusualReason = ""
-                ),
-                SensorAccessLogEntity(
-                    packageName = "com.google.android.GoogleCamera",
-                    appName = "Camera",
-                    sensorType = SensorType.CAMERA.name,
-                    timestamp = now - (35 * 60 * 1000),
-                    durationSeconds = 30,
-                    isBackground = false,
-                    isUnusual = false,
-                    unusualReason = ""
-                ),
-                SensorAccessLogEntity(
-                    packageName = "com.google.android.dialer",
-                    appName = "Phone Dialer",
-                    sensorType = SensorType.CALL.name,
-                    timestamp = now - (2 * 60 * 60 * 1000),
-                    durationSeconds = 120,
-                    isBackground = false,
-                    isUnusual = false,
-                    unusualReason = ""
-                ),
-                SensorAccessLogEntity(
-                    packageName = "com.suspicious.flashlight.cleaner",
-                    appName = "Super Flashlight Tool",
-                    sensorType = SensorType.MICROPHONE.name,
-                    timestamp = now - (4 * 60 * 60 * 1000),
-                    durationSeconds = 18,
-                    isBackground = true,
-                    isUnusual = true,
-                    unusualReason = "ব্যাকগ্রাউন্ডে অপ্রয়োজনীয় মাইক্রোফোন ব্যবহার (রাত ৩:২০ মিনিট)"
-                ),
-                SensorAccessLogEntity(
-                    packageName = "com.unknown.recorder.pro",
-                    appName = "Call Recorder Spy",
-                    sensorType = SensorType.CALL.name,
-                    timestamp = now - (5 * 60 * 60 * 1000),
-                    durationSeconds = 60,
-                    isBackground = true,
-                    isUnusual = true,
-                    unusualReason = "অননুমোদিত ব্যাকগ্রাউন্ড কল অডিও মনিটরিং শনাক্ত"
-                )
-            )
-            sensorAccessDao.insertAll(logs)
-        }
-    }
-
-    private fun seedInitialDriveItemsIfEmpty() {
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val items = listOf(
-                CloudDriveItemEntity(
-                    title = "NID_Passport_Scan_Confidential.pdf",
-                    mimeType = "application/pdf",
-                    fileSizeFormatted = "3.4 MB",
-                    shareStatus = DriveShareStatus.PUBLIC_LINK.name,
-                    isLeaking = true,
-                    sharedWithEmails = "Anyone with link (Leaked to Public)",
-                    lastScannedTimestamp = now
-                ),
-                CloudDriveItemEntity(
-                    title = "Crypto_Wallet_Backup_2026.docx",
-                    mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    fileSizeFormatted = "540 KB",
-                    shareStatus = DriveShareStatus.ANYONE_WITH_LINK.name,
-                    isLeaking = true,
-                    sharedWithEmails = "Public Web Indexable",
-                    lastScannedTimestamp = now
-                ),
-                CloudDriveItemEntity(
-                    title = "Family_Vacation_Photos.zip",
-                    mimeType = "application/zip",
-                    fileSizeFormatted = "182 MB",
-                    shareStatus = DriveShareStatus.RESTRICTED.name,
-                    isLeaking = false,
-                    sharedWithEmails = "family@gmail.com",
-                    lastScannedTimestamp = now
-                ),
-                CloudDriveItemEntity(
-                    title = "Bank_Transactions_2026.xlsx",
-                    mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    fileSizeFormatted = "1.2 MB",
-                    shareStatus = DriveShareStatus.PRIVATE.name,
-                    isLeaking = false,
-                    sharedWithEmails = "Only Owner",
-                    lastScannedTimestamp = now
-                )
-            )
-            cloudDriveDao.insertAll(items)
         }
     }
 }

@@ -115,6 +115,11 @@ fun FindHubScreen(
     val currentSpeedKmh by viewModel.currentSpeedKmh.collectAsState()
     val totalDistanceMeters by viewModel.totalDistanceTraveledMeters.collectAsState()
 
+    val isLockdownServiceRunning by viewModel.isLockdownServiceRunning.collectAsState()
+    val isLockdownActive by viewModel.isLockdownActive.collectAsState()
+    val lockdownAttemptCount by viewModel.lockdownAttemptCount.collectAsState()
+    val lockdownReason by viewModel.lockdownReason.collectAsState()
+
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
@@ -340,17 +345,54 @@ fun FindHubScreen(
                                 .padding(12.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Text(
-                                text = if (isBn) "লাস্ট নোন লোকেশন কোঅর্ডিনেট:" else "Last Known GPS Coordinates:",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Text(
-                                text = "${locationState.latitude}° N, ${locationState.longitude}° E",
-                                style = MaterialTheme.typography.titleSmall.copy(fontFamily = FontFamily.Monospace),
-                                color = NeonCyan,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (isBn) "জিপিএস অবস্থান ও ফিক্স টাইপ:" else "GPS Position & Fix Type:",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(NeonCyan.copy(alpha = 0.15f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                ) {
+                                    Text(
+                                        text = if (isBn) locationState.fixType.labelBn else locationState.fixType.labelEn,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NeonCyan,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            if (locationState.hasFix && locationState.latitude != null && locationState.longitude != null) {
+                                Text(
+                                    text = "${String.format(Locale.US, "%.5f", locationState.latitude)}° N, ${String.format(Locale.US, "%.5f", locationState.longitude)}° E",
+                                    style = MaterialTheme.typography.titleSmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = NeonCyan,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                locationState.accuracyMeters?.let { acc ->
+                                    Text(
+                                        text = if (isBn) "নির্ভুলতা (Accuracy): ±${acc.toInt()} মিটার (${locationState.provider ?: "GPS"})" else "Accuracy: ±${acc.toInt()}m (${locationState.provider ?: "GPS"})",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = if (isBn) "জিপিএস সিগন্যাল অপেক্ষমান..." else "Waiting for verified GPS signal...",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                    color = WarningAmber
+                                )
+                            }
 
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -365,21 +407,37 @@ fun FindHubScreen(
                                     )
                                 }
 
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Icon(Icons.Default.BatteryChargingFull, contentDescription = "Battery", tint = ShieldGreen, modifier = Modifier.size(14.dp))
-                                    Text(
-                                        text = "${locationState.batteryPercentage}% চার্জ",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
+                                if (locationState.batteryPercentage >= 0) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Icon(Icons.Default.BatteryChargingFull, contentDescription = "Battery", tint = ShieldGreen, modifier = Modifier.size(14.dp))
+                                        Text(
+                                            text = "${locationState.batteryPercentage}% চার্জ",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                    }
                                 }
                             }
+
+                            // Power-off limitation disclosure
+                            Text(
+                                text = if (isBn) {
+                                    "ℹ️ ফোন বন্ধ থাকলে বা ডাটা নেটওয়ার্ক বিচ্ছিন্ন হলে ডিভাইস কোনো লাইভ লোকেশন পাঠাতে পারে না।"
+                                } else {
+                                    "ℹ️ A powered-off or disconnected phone cannot report location updates."
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                                fontSize = 10.sp
+                            )
                         }
 
                         // Map Action
                         Button(
                             onClick = {
-                                val uri = Uri.parse("geo:${locationState.latitude},${locationState.longitude}?q=${locationState.latitude},${locationState.longitude}(SecureShield+Last+Known)")
+                                val lat = locationState.latitude ?: 23.8103
+                                val lng = locationState.longitude ?: 90.4125
+                                val uri = Uri.parse("geo:$lat,$lng?q=$lat,$lng(ShieldX+Location)")
                                 val mapIntent = Intent(Intent.ACTION_VIEW, uri)
                                 try {
                                     context.startActivity(mapIntent)
@@ -393,7 +451,7 @@ fun FindHubScreen(
                             Icon(Icons.Default.Map, contentDescription = "Map", tint = Color.Black, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (isBn) "গুগল ম্যাপে লাইভ অবস্থান দেখুন" else "View on Google Maps",
+                                text = if (isBn) "গুগল ম্যাপে অবস্থান দেখুন" else "View on Google Maps",
                                 color = Color.Black,
                                 fontWeight = FontWeight.Bold
                             )
@@ -620,86 +678,210 @@ fun FindHubScreen(
                 }
             }
 
-            // Section 2: Anti-Power-Off Protection
+            // Section 2: Device Lockdown Service & Anti-Power-Off Protection
             item {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 6.dp),
                     shape = RoundedCornerShape(20.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isLockdownActive) DangerRed.copy(alpha = 0.15f) else MaterialTheme.colorScheme.surfaceVariant
+                    ),
+                    border = CardDefaults.outlinedCardBorder().copy(
+                        brush = androidx.compose.ui.graphics.SolidColor(
+                            if (isLockdownActive) DangerRed else if (isLockdownServiceRunning) ShieldGreen else WarningAmber.copy(alpha = 0.5f)
+                        )
+                    )
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(42.dp)
-                                    .clip(CircleShape)
-                                    .background(WarningAmber.copy(alpha = 0.15f)),
-                                contentAlignment = Alignment.Center
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Icon(Icons.Default.PowerSettingsNew, contentDescription = "Power Off", tint = WarningAmber, modifier = Modifier.size(24.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(CircleShape)
+                                        .background(if (isLockdownServiceRunning) ShieldGreen.copy(alpha = 0.15f) else WarningAmber.copy(alpha = 0.15f)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.PowerSettingsNew,
+                                        contentDescription = "Power Off",
+                                        tint = if (isLockdownServiceRunning) ShieldGreen else WarningAmber,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+
+                                Column {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(8.dp)
+                                                .clip(CircleShape)
+                                                .background(if (isLockdownServiceRunning) ShieldGreen else WarningAmber)
+                                        )
+                                        Text(
+                                            text = if (isLockdownServiceRunning) (if (isBn) "লকডাউন সার্ভিস চালু" else "LOCKDOWN SERVICE ACTIVE") else (if (isBn) "সার্ভিস স্থগিত" else "SERVICE PAUSED"),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (isLockdownServiceRunning) ShieldGreen else WarningAmber,
+                                            letterSpacing = 1.sp
+                                        )
+                                    }
+                                    Text(
+                                        text = if (isBn) "ডিভাইস লকডাউন ও শাটডাউন ইন্টারসেপ্টর" else "Device Lockdown & Shutdown Guard",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
 
-                            Column {
-                                Text(
-                                    text = if (isBn) "পাওয়ার অফ প্রটেকশন (Anti-Power-Off)" else "Anti-Power-Off Protection",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = if (isBn) "আনলক বা লক অবস্থায় ওটিপি ছাড়া ফোন অফ করা যাবে না" else "Requires 2nd Phone OTP before device shutdown",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
+                            Switch(
+                                checked = isLockdownServiceRunning,
+                                onCheckedChange = { viewModel.toggleLockdownService(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = ShieldGreen
+                                ),
+                                modifier = Modifier.testTag("lockdown_service_switch")
+                            )
                         }
 
+                        // Explanation & Rules
                         Text(
                             text = if (isBn) {
-                                "💡 নিয়ম: কেউ ফোন অফ করতে চাইলে অবিলম্বে আপনার অন্য ফোনে ওটিপি যাবে। ওটিপি না দিলে শাটডাউন আটকে যাবে অথবা ছদ্মবেশী কালো স্ক্রিন দেখাবে যাতে চোর ভাবে ফোন অফ, অথচ ব্যাকগ্রাউন্ডে লাইভ ট্র্যাকিং চলবে।"
+                                "💡 নিয়ম: পাওয়ার বাটন চেপে ফোন অফ করার চেষ্টা বা সিস্টেম শাটডাউন ব্রডকাস্ট শনাক্ত হওয়ামাত্রই ডিভাইস লকডাউন সক্রিয় হয়। সেকেন্ডারি বিশ্বস্ত ফোনে ওটিপি পাঠানো হয় এবং ওটিপি দিয়ে অনুমোদন না করা পর্যন্ত ডিভাইস বন্ধ করা যাবে না।"
                             } else {
-                                "💡 Rule: Attempting to power off triggers an emergency OTP sent to your linked secondary phone. Without the OTP, it enters Decoy Shutdown."
+                                "💡 Rule: Long-pressing the power button or system shutdown triggers instant lockdown. An OTP is sent to your paired secondary phone; power-off is blocked until OTP authentication succeeds."
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
+                        // Monitored Triggers Box
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color.Black.copy(alpha = 0.3f))
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = if (isBn) "মনিটরিং ইভেন্টসমূহ (Monitored Triggers):" else "Monitored Security Triggers:",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = NeonCyan,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = if (isBn) "• পাওয়ার কি লং-প্রেস মেনু (Global Actions)" else "• Power Key Long-Press (Global Actions)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text("PROTECTED", color = ShieldGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = if (isBn) "• সিস্টেম শাটডাউন ব্রডকাস্ট (ACTION_SHUTDOWN)" else "• System Shutdown Broadcast",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text("INTERCEPTED", color = ShieldGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = if (isBn) "• পোস্ট-বুট বাধ্যতামূলক লক (Post-Boot Guard)" else "• Post-Boot Enforced Lockdown",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text("ENFORCED", color = ShieldGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            if (lockdownAttemptCount > 0) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Icon(Icons.Default.Warning, contentDescription = "Attempts", tint = DangerRed, modifier = Modifier.size(14.dp))
+                                    Text(
+                                        text = if (isBn) "মোট শাটডাউন চেষ্টা রোধ: $lockdownAttemptCount বার" else "Total Intercepted Attempts: $lockdownAttemptCount",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = DangerRed,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+
+                        // Paired Phone Info
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "${if (isBn) "অনুমোদন ডিভাইস:" else "OTP Target:"} ${viewModel.prefs.getSecondaryPhoneName()}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        // Action Buttons
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            OutlinedButton(
+                            Button(
                                 onClick = {
-                                    viewModel.triggerPowerOffAttempt()
+                                    viewModel.triggerPowerOffAttempt("Manual Lockdown Test / Power Key Trigger")
                                 },
+                                colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
                                 modifier = Modifier
                                     .weight(1f)
-                                    .testTag("test_power_off_btn")
+                                    .testTag("test_lockdown_attempt_btn")
                             ) {
-                                Text(if (isBn) "পাওয়ার অফ পরীক্ষা" else "Test Power-Off")
+                                Icon(Icons.Default.PowerSettingsNew, contentDescription = "Lockdown", modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (isBn) "অননুমোদিত শাটডাউন টেস্ট" else "Test Shutdown Lockdown",
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
 
-                            Button(
+                            OutlinedButton(
                                 onClick = {
                                     viewModel.activateFakeShutdownMode()
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = WarningAmber),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = WarningAmber),
                                 modifier = Modifier
                                     .weight(1f)
                                     .testTag("fake_shutdown_btn")
                             ) {
                                 Text(
-                                    text = if (isBn) "ছদ্মবেশী শাটডাউন" else "Fake Shutdown",
-                                    color = Color.Black,
+                                    text = if (isBn) "ছদ্মবেশী স্ক্রিন (Decoy)" else "Stealth Decoy",
                                     fontWeight = FontWeight.Bold
                                 )
                             }

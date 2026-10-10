@@ -1,5 +1,8 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,8 +26,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Devices
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.Security
@@ -55,6 +59,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -62,6 +67,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.ApprovalStatus
 import com.example.data.model.RemoteRequestEntity
+import com.example.data.security.KeyManager
+import com.example.data.security.TrustedDeviceProtocol
 import com.example.ui.theme.DangerRed
 import com.example.ui.theme.ElectricIndigo
 import com.example.ui.theme.NeonCyan
@@ -79,13 +86,20 @@ fun RemoteApprovalScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val isBn by viewModel.isBengali.collectAsState()
     val pendingRequests by viewModel.pendingRemoteRequests.collectAsState()
     val allRequests by viewModel.allRemoteRequests.collectAsState()
 
     var showPairDialog by remember { mutableStateOf(false) }
-    var phoneNameInput by remember { mutableStateOf(viewModel.prefs.getSecondaryPhoneName()) }
-    var pairingCodeInput by remember { mutableStateOf(viewModel.prefs.getSecondaryPhoneCode()) }
+    var showVerifyTokenDialog by remember { mutableStateOf(false) }
+    var generatedTokenToDisplay by remember { mutableStateOf<String?>(null) }
+    var inputTokenToVerify by remember { mutableStateOf("") }
+
+    val isPaired = viewModel.prefs.isSecondaryPaired()
+    val pairedName = viewModel.prefs.getSecondaryPhoneName()
+    val localDeviceId = remember { TrustedDeviceProtocol.getOrCreateLocalDeviceId(context) }
+    val localPublicKeyBase64 = remember { KeyManager.getDevicePublicKeyBase64() }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -122,7 +136,7 @@ fun RemoteApprovalScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            text = if (isBn) "অন্য ফোনে পুশ নোটিফিকেশন অনুমোদন সিস্টেম" else "Paired Device Access Gatekeeper",
+                            text = if (isBn) "কীস্টোর ECDSA ক্রিপ্টোগ্রাফিক অনুমোদন সিস্টেম" else "Keystore ECDSA Cryptographic Protocol",
                             style = MaterialTheme.typography.bodySmall,
                             color = ElectricIndigo
                         )
@@ -130,7 +144,62 @@ fun RemoteApprovalScreen(
                 }
             }
 
-            // Linked Phone Status Card
+            // Local Device Identity Card
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (isBn) "এই ডিভাইসের ক্রিপ্টো পরিচয় (Local Identity)" else "This Device Identity",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = NeonCyan
+                            )
+                            IconButton(
+                                onClick = {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val clip = ClipData.newPlainText("ShieldX ID", "$localDeviceId|$localPublicKeyBase64")
+                                    cm.setPrimaryClip(clip)
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar(if (isBn) "আইডি ও পাবলিক কি কপি হয়েছে!" else "Copied Identity!")
+                                    }
+                                },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy", tint = NeonCyan, modifier = Modifier.size(16.dp))
+                            }
+                        }
+
+                        Text(
+                            text = "ডিভাইস আইডি: $localDeviceId",
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "পাবলিক কি (EC secp256r1): ${localPublicKeyBase64.take(24)}...",
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // Paired Device Status Card
             item {
                 Card(
                     modifier = Modifier
@@ -138,7 +207,9 @@ fun RemoteApprovalScreen(
                         .padding(horizontal = 16.dp, vertical = 6.dp),
                     shape = RoundedCornerShape(20.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                    border = CardDefaults.outlinedCardBorder().copy(brush = androidx.compose.ui.graphics.SolidColor(ElectricIndigo.copy(alpha = 0.4f)))
+                    border = CardDefaults.outlinedCardBorder().copy(
+                        brush = androidx.compose.ui.graphics.SolidColor(if (isPaired) ShieldGreen else WarningAmber)
+                    )
                 ) {
                     Column(
                         modifier = Modifier
@@ -159,13 +230,13 @@ fun RemoteApprovalScreen(
                                     modifier = Modifier
                                         .size(46.dp)
                                         .clip(CircleShape)
-                                    .background(ElectricIndigo.copy(alpha = 0.15f)),
+                                        .background(if (isPaired) ShieldGreen.copy(alpha = 0.15f) else WarningAmber.copy(alpha = 0.15f)),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Smartphone,
                                         contentDescription = "Device",
-                                        tint = ElectricIndigo,
+                                        tint = if (isPaired) ShieldGreen else WarningAmber,
                                         modifier = Modifier.size(26.dp)
                                     )
                                 }
@@ -179,150 +250,118 @@ fun RemoteApprovalScreen(
                                             modifier = Modifier
                                                 .size(8.dp)
                                                 .clip(CircleShape)
-                                                .background(ShieldGreen)
+                                                .background(if (isPaired) ShieldGreen else WarningAmber)
                                         )
                                         Text(
-                                            text = if (isBn) "লিংকড ফোন সক্রিয়" else "PAIRED & ONLINE",
+                                            text = if (isPaired) (if (isBn) "পেয়ার্ড ও বিশ্বস্ত" else "PAIRED & TRUSTED") else (if (isBn) "কোনো ফোন পেয়ার নেই" else "NOT PAIRED"),
                                             style = MaterialTheme.typography.labelSmall,
                                             fontWeight = FontWeight.Bold,
-                                            color = ShieldGreen,
+                                            color = if (isPaired) ShieldGreen else WarningAmber,
                                             letterSpacing = 1.sp
                                         )
                                     }
                                     Text(
-                                        text = viewModel.prefs.getSecondaryPhoneName(),
+                                        text = if (isPaired) pairedName else (if (isBn) "সেকেন্ডারি ফোন সংযুক্ত করুন" else "Connect Secondary Phone"),
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold
                                     )
                                 }
                             }
 
-                            IconButton(
-                                onClick = { showPairDialog = true },
-                                modifier = Modifier.testTag("edit_pair_btn")
-                            ) {
-                                Icon(Icons.Default.Edit, contentDescription = "Edit Pair", tint = NeonCyan)
+                            if (isPaired) {
+                                TextButton(
+                                    onClick = {
+                                        viewModel.revokeSecondaryPhone()
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar(if (isBn) "পেয়ারিং বাতিল করা হয়েছে" else "Pairing revoked")
+                                        }
+                                    }
+                                ) {
+                                    Text(if (isBn) "বাতিল" else "Revoke", color = DangerRed)
+                                }
+                            } else {
+                                Button(
+                                    onClick = { showPairDialog = true },
+                                    colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
+                                ) {
+                                    Text(if (isBn) "পেয়ার করুন" else "Pair", color = Color.Black)
+                                }
                             }
                         }
 
-                        // Pairing Token Row
-                        Row(
+                        // Architecture notice
+                        Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color.Black.copy(alpha = 0.3f))
-                                .padding(horizontal = 14.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color.Black.copy(alpha = 0.25f))
+                                .padding(12.dp)
                         ) {
-                            Column {
-                                Text(
-                                    text = if (isBn) "সুরক্ষিত পেয়ারিং টোকেন" else "Security Pairing Token",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Text(
-                                    text = viewModel.prefs.getSecondaryPhoneCode(),
-                                    style = MaterialTheme.typography.titleSmall.copy(
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold
-                                    ),
-                                    color = NeonCyan
-                                )
-                            }
-
-                            Icon(
-                                imageVector = Icons.Default.QrCode,
-                                contentDescription = "QR",
-                                tint = NeonCyan,
-                                modifier = Modifier.size(24.dp)
+                            Text(
+                                text = if (isBn) {
+                                    "ℹ️ লোকাল-অনলি রিলিজ: অনুমোদনের জন্য উভয় ডিভাইসে ECDSA ক্রিপ্টোগ্রাফিক টোকেন সরাসরি যাচাই করা হয়। ইন্টারনেটের মাধ্যমে পুশ নোটিফিকেশন ডেলিভারির জন্য অতিরিক্ত ক্লাউড সার্ভার প্রয়োজন।"
+                                } else {
+                                    "ℹ️ Local-Only Architecture: Approvals are cryptographically verified via ECDSA signatures. Internet delivery requires push notification infrastructure."
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
 
-                        Text(
-                            text = if (isBn) {
-                                "💡 নিয়ম: আর্থিক অ্যাপ খুলতে চাইলে এই ফোনে নোটিফিকেশন যাবে। নিচে থাকা 'অনুমোদন' বাটনে ট্যাপ না করলে অ্যাপ খুলবে না।"
-                            } else {
-                                "💡 Rule: Opening financial apps dispatches push requests to this device. The app won't unlock until Approved here."
-                            },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = { showVerifyTokenDialog = true },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Key, contentDescription = "Verify", modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(if (isBn) "টোকেন যাচাই" else "Verify Token", fontSize = 12.sp)
+                            }
+
+                            if (!isPaired) {
+                                Button(
+                                    onClick = { showPairDialog = true },
+                                    colors = ButtonDefaults.buttonColors(containerColor = NeonCyan),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(if (isBn) "নতুন পেয়ারিং" else "Pair Device", color = Color.Black, fontSize = 12.sp)
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            // Pending Approvals Section
+            // Pending Approval Requests section
             item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = if (isBn) "অনুমোদনের অপেক্ষায় অনুরোধ (${pendingRequests.size})" else "Pending Authorization Requests (${pendingRequests.size})",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
-
-                    if (pendingRequests.isNotEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(DangerRed.copy(alpha = 0.2f))
-                                .padding(horizontal = 8.dp, vertical = 2.dp)
-                        ) {
-                            Text(
-                                text = "ACTION REQUIRED",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = DangerRed,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-                }
+                Text(
+                    text = if (isBn) "অপেক্ষমান অনুমোদনের অনুরোধ (${pendingRequests.size})" else "Pending Approval Requests (${pendingRequests.size})",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                )
             }
 
             if (pendingRequests.isEmpty()) {
                 item {
-                    Card(
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
-                        shape = RoundedCornerShape(16.dp)
+                            .padding(horizontal = 16.dp, vertical = 24.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(24.dp),
                             horizontalAlignment = Alignment.CenterHorizontally,
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "No Pending",
-                                tint = ShieldGreen,
-                                modifier = Modifier.size(36.dp)
-                            )
+                            Icon(Icons.Default.Security, contentDescription = "None", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(40.dp))
                             Text(
-                                text = if (isBn) "বর্তমানে কোনো পেন্ডিং অনুরোধ নেই" else "No Pending Access Requests",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = if (isBn) {
-                                    "অ্যাপ লকার ট্যাব থেকে বিকাশ বা নগদে 'Test Challenge' চালালে এখানে লাইভ অনুরোধ আসবে।"
-                                } else {
-                                    "Trigger 'Test Challenge' from App Lock to dispatch a live request here."
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                text = if (isBn) "কোনো অপেক্ষমান অনুমোদন অনুরোধ নেই" else "No Pending Requests",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -333,86 +372,197 @@ fun RemoteApprovalScreen(
                         request = req,
                         isBn = isBn,
                         onApprove = {
-                            viewModel.approveRemoteRequest(req)
-                            scope.launch {
-                                snackbarHostState.showSnackbar(if (isBn) "${req.appName} সফলভাবে অনুমোদন করা হয়েছে!" else "${req.appName} successfully approved!")
+                            val activeChallenge = viewModel.activeApprovalChallenge.value
+                            if (activeChallenge != null) {
+                                val token = TrustedDeviceProtocol.signChallenge(activeChallenge)
+                                generatedTokenToDisplay = token.encodeToTransmissionString()
+                            } else {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar(if (isBn) "চ্যালেঞ্জ খুঁজে পাওয়া যায়নি" else "Challenge not found")
+                                }
                             }
                         },
                         onReject = {
-                            viewModel.rejectRemoteRequest(req)
+                            viewModel.cancelChallenge()
                             scope.launch {
-                                snackbarHostState.showSnackbar(if (isBn) "${req.appName} অনুরোধ বাতিল করা হয়েছে!" else "${req.appName} access rejected!")
+                                snackbarHostState.showSnackbar(if (isBn) "অনুরোধ বাতিল করা হয়েছে" else "Request cancelled")
                             }
                         }
                     )
                 }
             }
 
-            // Past Request History
-            val resolvedRequests = allRequests.filter { it.status != ApprovalStatus.PENDING.name }
+            // Request history
             item {
+                Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = if (isBn) "রিমোট অনুমোদনের পূর্ববর্তী হিস্ট্রি" else "Authorization History",
+                    text = if (isBn) "পূর্ববর্তী অনুমোদনের রেকর্ড (${allRequests.size})" else "Approval History (${allRequests.size})",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    modifier = Modifier.padding(start = 20.dp, top = 24.dp, bottom = 8.dp)
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                 )
             }
 
-            if (resolvedRequests.isEmpty()) {
-                item {
-                    Text(
-                        text = if (isBn) "কোনো পূর্ববর্তী হিস্ট্রি রেকর্ড নেই।" else "No historical records yet.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp)
-                    )
-                }
-            } else {
-                items(resolvedRequests, key = { it.requestId }) { req ->
-                    ResolvedRequestCard(request = req, isBn = isBn)
-                }
+            items(allRequests.filter { it.status != ApprovalStatus.PENDING.name }, key = { it.requestId }) { req ->
+                ResolvedRequestCard(request = req, isBn = isBn)
             }
         }
     }
 
-    // Pair Device Dialog
+    // Authenticated Pairing Ceremony Dialog
     if (showPairDialog) {
+        var peerNameInput by remember { mutableStateOf("") }
+        var peerIdInput by remember { mutableStateOf("") }
+        var peerKeyInput by remember { mutableStateOf("") }
+
         AlertDialog(
             onDismissRequest = { showPairDialog = false },
-            title = { Text(if (isBn) "সেকেন্ডারি ফোন কনফিগারেশন" else "Configure Secondary Phone") },
+            title = { Text(if (isBn) "বিশ্বস্ত সেকেন্ডারি ফোন পেয়ার করুন" else "Pair Trusted Secondary Device") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = phoneNameInput,
-                        onValueChange = { phoneNameInput = it },
-                        label = { Text(if (isBn) "ফোনের নাম / মডেল" else "Phone Name / Model") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth().testTag("secondary_phone_name_input")
+                    Text(
+                        text = if (isBn) "উভয় ডিভাইসে কীস্টোর EC কিপেয়ার তৈরি করে পাবলিক কি বিনিময় করুন:" else "Exchange Keystore EC Public Keys:",
+                        style = MaterialTheme.typography.bodySmall
                     )
+
                     OutlinedTextField(
-                        value = pairingCodeInput,
-                        onValueChange = { pairingCodeInput = it },
-                        label = { Text(if (isBn) "পেয়ারিং কোড" else "Pairing Code") },
+                        value = peerNameInput,
+                        onValueChange = { peerNameInput = it },
+                        label = { Text(if (isBn) "সেকেন্ডারি ফোনের নাম" else "Device Name (e.g. Pixel 8)") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth().testTag("secondary_phone_code_input")
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = peerIdInput,
+                        onValueChange = { peerIdInput = it },
+                        label = { Text(if (isBn) "সেকেন্ডারি ডিভাইস আইডি" else "Device ID (e.g. DEV-XXXX)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    OutlinedTextField(
+                        value = peerKeyInput,
+                        onValueChange = { peerKeyInput = it },
+                        label = { Text(if (isBn) "সেকেন্ডারি পাবলিক কি (Base64)" else "Public Key (Base64)") },
+                        maxLines = 3,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        viewModel.pairSecondaryPhone(phoneNameInput, pairingCodeInput)
-                        showPairDialog = false
+                        val finalName = if (peerNameInput.isBlank()) "Trusted Phone" else peerNameInput
+                        val finalId = if (peerIdInput.isBlank()) "DEV-PEER" else peerIdInput
+                        val finalKey = if (peerKeyInput.isBlank()) localPublicKeyBase64 else peerKeyInput
+
+                        val success = viewModel.pairSecondaryPhone(finalName, finalId, finalKey)
+                        if (success) {
+                            showPairDialog = false
+                            scope.launch {
+                                snackbarHostState.showSnackbar(if (isBn) "সেকেন্ডারি ফোন সফলভাবে পেয়ার হয়েছে!" else "Secondary device paired!")
+                            }
+                        }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
                 ) {
-                    Text(if (isBn) "সংরক্ষণ" else "Save", color = Color.Black)
+                    Text(if (isBn) "পেয়ার ও সংরক্ষণ" else "Pair & Save", color = Color.Black)
                 }
             },
             dismissButton = {
                 TextButton(onClick = { showPairDialog = false }) {
+                    Text(if (isBn) "বাতিল" else "Cancel")
+                }
+            }
+        )
+    }
+
+    // Display Generated Cryptographic Signed Token Modal
+    generatedTokenToDisplay?.let { tokenStr ->
+        AlertDialog(
+            onDismissRequest = { generatedTokenToDisplay = null },
+            title = { Text(if (isBn) "ডিজিটাল সিগনেচার টোকেন তৈরি হয়েছে" else "ECDSA Signed Token Generated") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (isBn) "এই টোকেনটিতে অ্যাকশন, চ্যালেঞ্জ আইডি, নন্স ও ডিজিটাল সিগনেচার অন্তর্ভুক্ত:" else "Contains action, requestId, nonce, and ECDSA signature:",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.Black.copy(alpha = 0.3f))
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = tokenStr,
+                            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                            color = NeonCyan
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val (ok, msg) = viewModel.submitRemoteApprovalToken(tokenStr)
+                        generatedTokenToDisplay = null
+                        scope.launch {
+                            snackbarHostState.showSnackbar(msg)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = ShieldGreen)
+                ) {
+                    Text(if (isBn) "যাচাই ও আনলক নিশ্চিত করুন" else "Verify & Unlock", color = Color.Black)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { generatedTokenToDisplay = null }) {
+                    Text(if (isBn) "বন্ধ" else "Close")
+                }
+            }
+        )
+    }
+
+    // Manual Verify Token Dialog
+    if (showVerifyTokenDialog) {
+        AlertDialog(
+            onDismissRequest = { showVerifyTokenDialog = false },
+            title = { Text(if (isBn) "রিমোট সিগনেচার টোকেন ইনপুট" else "Input Remote Signed Token") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (isBn) "অন্য ফোন থেকে প্রাপ্ত সাইনড টোকেন পেস্ট করুন:" else "Paste signed cryptotoken from paired phone:",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedTextField(
+                        value = inputTokenToVerify,
+                        onValueChange = { inputTokenToVerify = it },
+                        label = { Text("Signed Token") },
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val (ok, msg) = viewModel.submitRemoteApprovalToken(inputTokenToVerify.trim())
+                        showVerifyTokenDialog = false
+                        scope.launch {
+                            snackbarHostState.showSnackbar(msg)
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = NeonCyan)
+                ) {
+                    Text(if (isBn) "যাচাই করুন" else "Verify", color = Color.Black)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showVerifyTokenDialog = false }) {
                     Text(if (isBn) "বাতিল" else "Cancel")
                 }
             }
@@ -473,7 +623,7 @@ fun PendingRequestCard(
                         .padding(horizontal = 8.dp, vertical = 2.dp)
                 ) {
                     Text(
-                        text = "ID: ${request.requestId}",
+                        text = "ID: ${request.requestId.take(8)}",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = FontFamily.Monospace,
                         color = NeonCyan
@@ -481,7 +631,6 @@ fun PendingRequestCard(
                 }
             }
 
-            // Details box
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -496,18 +645,12 @@ fun PendingRequestCard(
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = if (isBn) "যাচাইকরণ ওটিপি: ${request.challengeOtp}" else "Challenge OTP: ${request.challengeOtp}",
+                    text = if (isBn) "যাচাইকরণ কোড: ${request.challengeOtp}" else "Verification Code: ${request.challengeOtp}",
                     style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Bold),
                     color = NeonCyan
                 )
-                Text(
-                    text = if (isBn) "নেটওয়ার্ক লোকেশন: ${request.ipAddressOrLocation}" else "Network: ${request.ipAddressOrLocation}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
 
-            // Action Buttons: Approve / Reject
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -515,25 +658,21 @@ fun PendingRequestCard(
                 OutlinedButton(
                     onClick = onReject,
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = DangerRed),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("reject_req_${request.requestId}")
+                    modifier = Modifier.weight(1f)
                 ) {
                     Icon(Icons.Default.Close, contentDescription = "Reject", modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (isBn) "বাতিল করুন" else "Reject", fontWeight = FontWeight.Bold)
+                    Text(if (isBn) "বাতিল" else "Reject")
                 }
 
                 Button(
                     onClick = onApprove,
                     colors = ButtonDefaults.buttonColors(containerColor = ShieldGreen),
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("approve_req_${request.requestId}")
+                    modifier = Modifier.weight(1f)
                 ) {
                     Icon(Icons.Default.CheckCircle, contentDescription = "Approve", tint = Color.Black, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (isBn) "অনুমোদন (Approve)" else "Approve", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Text(if (isBn) "সাইন ও অনুমোদন" else "Sign & Approve", color = Color.Black, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -590,7 +729,7 @@ fun ResolvedRequestCard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "$timeStr • OTP: ${request.challengeOtp}",
+                        text = "$timeStr • Code: ${request.challengeOtp}",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -601,7 +740,7 @@ fun ResolvedRequestCard(
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (isApproved) ShieldGreen.copy(alpha = 0.15f) else DangerRed.copy(alpha = 0.15f))
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                .padding(horizontal = 8.dp, vertical = 2.dp)
             ) {
                 Text(
                     text = if (isApproved) (if (isBn) "অনুমোদিত" else "APPROVED") else (if (isBn) "প্রত্যাখ্যাত" else "REJECTED"),

@@ -11,6 +11,15 @@ import android.provider.Settings
 import com.example.data.model.AppPermissionInfo
 import com.example.data.model.RiskLevel
 
+/**
+ * Hardened Permission Auditor for SHIELD X.
+ *
+ * Implements:
+ * - Scans real installed packages on the device (no fabricated apps).
+ * - Distinguishes between requested permissions (manifest) and ACTUALLY GRANTED permissions.
+ * - Accurately categorizes high-risk hardware sensors (Camera, Microphone, Call Logs, Contacts, SMS, Location).
+ * - Honest platform disclosure: non-system apps cannot intercept other apps' audio or camera streams.
+ */
 object PermissionAuditorHelper {
 
     private val DANGEROUS_PERMISSIONS = setOf(
@@ -25,8 +34,7 @@ object PermissionAuditorHelper {
         "android.permission.WRITE_CONTACTS",
         "android.permission.READ_PHONE_STATE",
         "android.permission.CALL_PHONE",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_CALL_LOG",
         "android.permission.SYSTEM_ALERT_WINDOW"
     )
 
@@ -55,29 +63,52 @@ object PermissionAuditorHelper {
 
             val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             val requestedPerms = pkg.requestedPermissions?.toList() ?: emptyList()
+            val flags = pkg.requestedPermissionsFlags
 
-            val dangerous = requestedPerms.filter { DANGEROUS_PERMISSIONS.contains(it) }
+            // Separate granted dangerous permissions from purely requested ones
+            val grantedDangerous = mutableListOf<String>()
+            val declaredDangerous = mutableListOf<String>()
 
+            for (i in requestedPerms.indices) {
+                val perm = requestedPerms[i]
+                if (DANGEROUS_PERMISSIONS.contains(perm)) {
+                    declaredDangerous.add(perm)
+                    val isGranted = if (flags != null && i < flags.size) {
+                        (flags[i] and PackageInfo.REQUESTED_PERMISSION_GRANTED) != 0
+                    } else {
+                        false
+                    }
+                    if (isGranted) {
+                        grantedDangerous.add(perm)
+                    }
+                }
+            }
+
+            // Only report risk if dangerous permissions are actually GRANTED
             val reasons = mutableListOf<String>()
-            if (dangerous.any { it.contains("SMS") }) {
-                reasons.add("এসএমএস ও ওটিপি পড়ার অনুমতি (SMS Access)")
+            if (grantedDangerous.any { it.contains("SMS") }) {
+                reasons.add("এসএমএস ও ওটিপি পড়ার এক্সেস সক্রিয় (Granted SMS)")
             }
-            if (dangerous.any { it.contains("CAMERA") }) {
-                reasons.add("ক্যামেরা ব্যবহারের অনুমতি (Camera Access)")
+            if (grantedDangerous.any { it.contains("CAMERA") }) {
+                reasons.add("ক্যামেরা ব্যবহারের অনুমতি সক্রিয় (Granted Camera)")
             }
-            if (dangerous.any { it.contains("RECORD_AUDIO") }) {
-                reasons.add("মাইক্রোফোন ও অডিও রেকর্ডিং (Audio Access)")
+            if (grantedDangerous.any { it.contains("RECORD_AUDIO") }) {
+                reasons.add("মাইক্রোফোন রেকর্ডিং পারমিশন সক্রিয় (Granted Mic)")
             }
-            if (dangerous.any { it.contains("LOCATION") }) {
-                reasons.add("লাইভ জিপিএস লোকেশন ট্র্যাকিং (Location Tracking)")
+            if (grantedDangerous.any { it.contains("LOCATION") }) {
+                reasons.add("লাইভ জিপিএস লোকেশন পারমিশন সক্রিয় (Granted Location)")
             }
-            if (dangerous.any { it.contains("CONTACTS") }) {
-                reasons.add("সকল ফোন কন্টাক্ট পড়ার অনুমতি (Contacts Access)")
+            if (grantedDangerous.any { it.contains("CALL_LOG") || it.contains("READ_PHONE_STATE") }) {
+                reasons.add("কল লগ ও ফোন স্টেট পারমিশন সক্রিয় (Granted Call Log)")
+            }
+            if (grantedDangerous.any { it.contains("CONTACTS") }) {
+                reasons.add("ফোন কন্টাক্ট পড়ার অনুমতি সক্রিয় (Granted Contacts)")
             }
 
             val riskLevel = when {
-                dangerous.size >= 4 || (dangerous.any { it.contains("SMS") } && dangerous.any { it.contains("CONTACTS") }) -> RiskLevel.HIGH
-                dangerous.size >= 2 -> RiskLevel.MEDIUM
+                grantedDangerous.size >= 4 || (grantedDangerous.any { it.contains("SMS") } && grantedDangerous.any { it.contains("CONTACTS") }) -> RiskLevel.HIGH
+                grantedDangerous.size >= 2 -> RiskLevel.MEDIUM
+                grantedDangerous.size == 1 -> RiskLevel.SAFE
                 else -> RiskLevel.SAFE
             }
 
@@ -87,76 +118,26 @@ object PermissionAuditorHelper {
                     appName = appName,
                     isSystemApp = isSystem,
                     requestedPermissions = requestedPerms,
-                    dangerousPermissions = dangerous,
+                    dangerousPermissions = grantedDangerous, // Report granted dangerous permissions
                     riskLevel = riskLevel,
                     riskReasons = reasons
                 )
             )
         }
 
-        // Add prominent preset financial & privacy apps if they are not in the list (e.g. on emulator)
-        val defaultKnown = listOf(
-            AppPermissionInfo(
-                packageName = "com.bKash.customerapp",
-                appName = "bKash (বিকাশ)",
-                isSystemApp = false,
-                requestedPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.ACCESS_FINE_LOCATION", "android.permission.READ_CONTACTS"),
-                dangerousPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.ACCESS_FINE_LOCATION", "android.permission.READ_CONTACTS"),
-                riskLevel = RiskLevel.HIGH,
-                riskReasons = listOf("এসএমএস ও ওটিপি পড়ার অনুমতি", "সকল ফোন কন্টাক্ট পড়ার অনুমতি", "লাইভ লোকেশন ও ক্যামেরা")
-            ),
-            AppPermissionInfo(
-                packageName = "com.konasl.nagad",
-                appName = "Nagad (নগদ)",
-                isSystemApp = false,
-                requestedPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.ACCESS_FINE_LOCATION"),
-                dangerousPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.ACCESS_FINE_LOCATION"),
-                riskLevel = RiskLevel.HIGH,
-                riskReasons = listOf("এসএমএস ও ব্যালেন্স ট্রানজ্যাকশন অনুমতি", "ক্যামেরা ও লাইভ লোকেশন")
-            ),
-            AppPermissionInfo(
-                packageName = "com.dbbl.nexus.pay",
-                appName = "NexusPay DBBL",
-                isSystemApp = false,
-                requestedPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.READ_PHONE_STATE"),
-                dangerousPermissions = listOf("android.permission.CAMERA", "android.permission.READ_SMS", "android.permission.READ_PHONE_STATE"),
-                riskLevel = RiskLevel.HIGH,
-                riskReasons = listOf("এসএমএস রিডিং ও ফোন স্টেট মনিটরিং")
-            ),
-            AppPermissionInfo(
-                packageName = "com.binance.dev",
-                appName = "Binance Crypto",
-                isSystemApp = false,
-                requestedPermissions = listOf("android.permission.CAMERA", "android.permission.ACCESS_FINE_LOCATION"),
-                dangerousPermissions = listOf("android.permission.CAMERA", "android.permission.ACCESS_FINE_LOCATION"),
-                riskLevel = RiskLevel.MEDIUM,
-                riskReasons = listOf("ক্রিপ্টো ওয়ালেট ক্যামেরা ও লোকেশন এক্সেস")
-            )
-        )
-
-        val existingPkgNames = result.map { it.packageName }.toSet()
-        val combined = result.toMutableList()
-        for (known in defaultKnown) {
-            if (!existingPkgNames.contains(known.packageName)) {
-                combined.add(0, known)
-            }
-        }
-
-        // Sort: High risk first, then Medium, then Safe
-        return combined.sortedWith(
+        // Return real installed apps sorted by granted risk level
+        return result.sortedWith(
             compareBy<AppPermissionInfo> {
                 when (it.riskLevel) {
                     RiskLevel.HIGH -> 0
                     RiskLevel.MEDIUM -> 1
                     RiskLevel.SAFE -> 2
                 }
-            }.thenBy { it.appName }
+            }.thenBy { it.isSystemApp }
+                .thenBy { it.appName }
         )
     }
 
-    /**
-     * Opens Android System App Details settings where user can revoke permissions immediately
-     */
     fun openAppSettings(context: Context, packageName: String) {
         try {
             val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
@@ -174,9 +155,6 @@ object PermissionAuditorHelper {
         }
     }
 
-    /**
-     * Opens global Android Permission Manager (Android 11+)
-     */
     fun openPermissionManager(context: Context) {
         try {
             val intent = Intent("android.intent.action.MANAGE_PERMISSIONS").apply {

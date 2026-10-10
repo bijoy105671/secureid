@@ -1,6 +1,6 @@
 {
-  "name": "SecureShield",
-  "description": "Smart security vault for encrypted files, financial app lock with dynamic OTP and secondary phone approval, privacy permission auditor, and share logs.",
+  "name": "SHIELD X",
+  "description": "Android Security & Anti-Theft App with AES-256-GCM hardware vault, ECDSA trusted-device approval, lockdown shutdown guard, and privacy auditing.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
