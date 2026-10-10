@@ -1,0 +1,6 @@
+{
+  "name": "SecureShield",
+  "description": "Smart security vault for encrypted files, financial app lock with dynamic OTP and secondary phone approval, privacy permission auditor, and share logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
